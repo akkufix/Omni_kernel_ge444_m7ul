@@ -455,7 +455,6 @@ extern int register_security(struct security_operations *ops);
 extern void __init security_fixup_ops(struct security_operations *ops);
 
 
-/* Security operations */
 int security_binder_set_context_mgr(struct task_struct *mgr);
 int security_binder_transaction(struct task_struct *from, struct task_struct *to);
 int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to);

@@ -15,7 +15,7 @@
 #include <linux/ioport.h>
 #include <linux/platform_device.h>
 #include <linux/bootmem.h>
-#include <linux/ion.h>
+#include <linux/msm_ion.h>
 #include <asm/mach-types.h>
 #include <mach/msm_memtypes.h>
 #include <mach/board.h>
@@ -35,10 +35,6 @@
 #include "../../../../drivers/video/msm/mdp4.h"
 #include <linux/i2c.h>
 #include <mach/msm_xo.h>
-
-#ifdef CONFIG_BMA250_WAKE_OPTIONS
-#include <linux/bma250.h>
-#endif
 
 #ifdef CONFIG_FB_MSM_TRIPLE_BUFFER
 #define MSM_FB_PRIM_BUF_SIZE (1920 * ALIGN(1080, 32) * 4 * 3)
@@ -144,8 +140,8 @@ static struct msm_bus_vectors mdp_ui_vectors[] = {
 	{
 		.src = MSM_BUS_MASTER_MDP_PORT0,
 		.dst = MSM_BUS_SLAVE_EBI_CH0,
-		.ab = 216000000 * 2,
-		.ib = 270000000 * 2,
+		.ab = 577474560 * 2,
+		.ib = 866211840 * 2,
 	},
 };
 
@@ -154,8 +150,8 @@ static struct msm_bus_vectors mdp_vga_vectors[] = {
 	{
 		.src = MSM_BUS_MASTER_MDP_PORT0,
 		.dst = MSM_BUS_SLAVE_EBI_CH0,
-		.ab = 216000000 * 2,
-		.ib = 270000000 * 2,
+		.ab = 605122560 * 2,
+		.ib = 756403200 * 2,
 	},
 };
 
@@ -164,8 +160,8 @@ static struct msm_bus_vectors mdp_720p_vectors[] = {
 	{
 		.src = MSM_BUS_MASTER_MDP_PORT0,
 		.dst = MSM_BUS_SLAVE_EBI_CH0,
-		.ab = 230400000 * 2,
-		.ib = 288000000 * 2,
+		.ab = 660418560 * 2,
+		.ib = 825523200 * 2,
 	},
 };
 
@@ -174,8 +170,8 @@ static struct msm_bus_vectors mdp_1080p_vectors[] = {
 	{
 		.src = MSM_BUS_MASTER_MDP_PORT0,
 		.dst = MSM_BUS_SLAVE_EBI_CH0,
-		.ab = 334080000 * 2,
-		.ib = 417600000 * 2,
+		.ab = 764098560 * 2,
+		.ib = 955123200 * 2,
 	},
 };
 
@@ -786,10 +782,6 @@ int m7_mdp_gamma(void)
 
 static struct msm_panel_common_pdata mdp_pdata = {
 	.gpio = MDP_VSYNC_GPIO,
-	.mdp_max_clk = 266667000,
-	.mdp_max_bw = 4290000000UL,
-	.mdp_bw_ab_factor = 115,
-	.mdp_bw_ib_factor = 200,
 #ifdef CONFIG_MSM_BUS_SCALING
 	.mdp_bus_scale_table = &mdp_bus_scale_pdata,
 #endif
@@ -802,6 +794,7 @@ static struct msm_panel_common_pdata mdp_pdata = {
 	.cont_splash_enabled = 0x00,
 	.mdp_gamma = m7_mdp_gamma,
 	.mdp_iommu_split_domain = 1,
+	.mdp_max_clk = 200000000,
 };
 
 static char wfd_check_mdp_iommu_split_domain(void)
@@ -979,15 +972,7 @@ static int mipi_dsi_panel_power(int on)
 			return -ENODEV;
 		}
 	}
-#ifdef CONFIG_BMA250_WAKE_OPTIONS
-	if (on) {
-		printk("[BMA250] Mipi Power On -> calling gyroscope enable 1 (enable)\n");
-		gyroscope_enable(1);
-	} else {
-		printk("[BMA250] Mipi Power Off -> calling gyroscope enable 0 (disable)\n");
-		gyroscope_enable(0);
-	}
-#endif
+
 	return 0;
 }
 
@@ -1683,12 +1668,9 @@ static int __devinit m7_lcd_probe(struct platform_device *pdev)
 	PR_DISP_INFO("%s\n", __func__);
 	return 0;
 }
-static int m7_display_on(struct platform_device *pdev)
+static void m7_display_on(struct msm_fb_data_type *mfd)
 {
-	struct msm_fb_data_type *mfd;
-
-	mfd = platform_get_drvdata(pdev);
-
+	
 	if (panel_type == PANEL_ID_DLXJ_SHARP_RENESAS ||
 		panel_type == PANEL_ID_DLXJ_SONY_RENESAS ||
 		panel_type == PANEL_ID_M7_SHARP_RENESAS)
@@ -1705,15 +1687,10 @@ static int m7_display_on(struct platform_device *pdev)
 	mipi_dsi_cmdlist_put(&cmdreq);
 
 	PR_DISP_INFO("%s\n", __func__);
-	return 0;
 }
 
-static int m7_display_off(struct platform_device *pdev)
+static void m7_display_off(struct msm_fb_data_type *mfd)
 {
-	struct msm_fb_data_type *mfd;
-
-	mfd = platform_get_drvdata(pdev);
-
 	cmdreq.cmds = display_off_cmds;
 	cmdreq.cmds_cnt = display_off_cmds_count;
 	cmdreq.flags = CMD_REQ_COMMIT;
@@ -1726,7 +1703,6 @@ static int m7_display_off(struct platform_device *pdev)
 	mipi_dsi_cmdlist_put(&cmdreq);
 
 	PR_DISP_INFO("%s\n", __func__);
-	return 0;
 }
 
 #ifdef CABC_DIMMING_SWITCH
@@ -2272,8 +2248,8 @@ static struct msm_fb_panel_data m7_panel_data = {
 	.on	= m7_lcd_on,
 	.off	= m7_lcd_off,
 	.set_backlight = m7_set_backlight,
-	.late_init = m7_display_on,
-	.early_off = m7_display_off,
+	.display_on = m7_display_on,
+	.display_off = m7_display_off,
 	.color_enhance = m7_color_enhance,
 #ifdef CABC_DIMMING_SWITCH
 	.dimming_on = m7_dim_on,
@@ -2379,11 +2355,6 @@ static int __init mipi_cmd_jdi_renesas_init(void)
 	pinfo.lcd.v_front_porch = pinfo.lcdc.v_front_porch;
 	pinfo.lcd.v_pulse_width = pinfo.lcdc.v_pulse_width;
 
-	pinfo.lcd.primary_vsync_init = pinfo.yres;
-	pinfo.lcd.primary_rdptr_irq = 0;
-	pinfo.lcd.primary_start_pos = pinfo.yres +
-			pinfo.lcd.v_back_porch + pinfo.lcd.v_front_porch - 1;
-
 	pinfo.lcdc.border_clr = 0;      
 	pinfo.lcdc.underflow_clr = 0xff;        
 	pinfo.lcdc.hsync_skew = 0;
@@ -2473,8 +2444,8 @@ static int __init mipi_cmd_sharp_init(void)
 	pinfo.pdest = DISPLAY_1;
 	pinfo.wait_cycle = 0;
 	pinfo.bpp = 24;
-    pinfo.width = 58;
-    pinfo.height = 103;
+        pinfo.width = 58;
+        pinfo.height = 103;
 	pinfo.camera_backlight = 183;
 
 	pinfo.lcdc.h_back_porch = 27;
@@ -2483,15 +2454,10 @@ static int __init mipi_cmd_sharp_init(void)
 	pinfo.lcdc.v_back_porch = 4;
 	pinfo.lcdc.v_front_porch = 4;
 	pinfo.lcdc.v_pulse_width = 2;
- 
+
 	pinfo.lcd.v_back_porch = pinfo.lcdc.v_back_porch;
 	pinfo.lcd.v_front_porch = pinfo.lcdc.v_front_porch;
 	pinfo.lcd.v_pulse_width = pinfo.lcdc.v_pulse_width;
-
-	pinfo.lcd.primary_vsync_init = pinfo.yres;
-	pinfo.lcd.primary_rdptr_irq = 0;
-	pinfo.lcd.primary_start_pos = pinfo.yres +
-			pinfo.lcd.v_back_porch + pinfo.lcd.v_front_porch - 1;
 
 	pinfo.lcdc.border_clr = 0;	
 	pinfo.lcdc.underflow_clr = 0xff;	
@@ -2598,11 +2564,6 @@ static int __init mipi_video_sharp_init(void)
 	pinfo.lcd.v_front_porch = 4;
 	pinfo.lcd.v_pulse_width = 2;
 
-	pinfo.lcd.primary_vsync_init = pinfo.yres;
-	pinfo.lcd.primary_rdptr_irq = 0;
-	pinfo.lcd.primary_start_pos = pinfo.yres +
-			pinfo.lcd.v_back_porch + pinfo.lcd.v_front_porch - 1;
-
 	pinfo.lcdc.border_clr = 0;	
 	pinfo.lcdc.underflow_clr = 0xff;	
 	pinfo.lcdc.hsync_skew = 0;
@@ -2700,11 +2661,6 @@ static int __init mipi_video_sony_init(void)
 	pinfo.lcd.v_front_porch = 3;
 	pinfo.lcd.v_pulse_width = 2;
 
-	pinfo.lcd.primary_vsync_init = pinfo.yres;
-	pinfo.lcd.primary_rdptr_irq = 0;
-	pinfo.lcd.primary_start_pos = pinfo.yres +
-		pinfo.lcd.v_back_porch + pinfo.lcd.v_front_porch - 1;
-
 	pinfo.lcdc.border_clr = 0;	
 	pinfo.lcdc.underflow_clr = 0xff;	
 	pinfo.lcdc.hsync_skew = 0;
@@ -2778,8 +2734,8 @@ static int __init mipi_command_samsung_init(void)
 	pinfo.pdest = DISPLAY_1;
 	pinfo.wait_cycle = 0;
 	pinfo.bpp = 24;
-	pinfo.width = 58;
-	pinfo.height = 103;
+        pinfo.width = 58;
+        pinfo.height = 103;
 	pinfo.camera_backlight = 183;
 
 	pinfo.lcdc.h_back_porch = 27;
@@ -2792,11 +2748,6 @@ static int __init mipi_command_samsung_init(void)
 	pinfo.lcd.v_back_porch = pinfo.lcdc.v_back_porch;
 	pinfo.lcd.v_front_porch = pinfo.lcdc.v_front_porch;
 	pinfo.lcd.v_pulse_width = pinfo.lcdc.v_pulse_width;
-
-	pinfo.lcd.primary_vsync_init = pinfo.yres;
-	pinfo.lcd.primary_rdptr_irq = 0;
-	pinfo.lcd.primary_start_pos = pinfo.yres +
-			pinfo.lcd.v_back_porch + pinfo.lcd.v_front_porch - 1;
 
 	pinfo.lcdc.border_clr = 0;	
 	pinfo.lcdc.underflow_clr = 0xff;	
@@ -2921,7 +2872,7 @@ static const struct i2c_device_id pwm_i2c_id[] = {
 static int pwm_i2c_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
-	int rc;
+	int rc = 0;
 
 	if (!i2c_check_functionality(client->adapter,
 				     I2C_FUNC_SMBUS_BYTE | I2C_FUNC_I2C))

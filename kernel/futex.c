@@ -60,7 +60,6 @@
 #include <linux/pid.h>
 #include <linux/nsproxy.h>
 #include <linux/ptrace.h>
-#include <linux/freezer.h>
 
 #include <asm/futex.h>
 
@@ -861,40 +860,15 @@ static int futex_requeue(u32 __user *uaddr1, unsigned int flags,
 	u32 curval2;
 
 	if (requeue_pi) {
-		/*
-		 * Requeue PI only works on two distinct uaddrs. This
-		 * check is only valid for private futexes. See below.
-		 */
-		if (uaddr1 == uaddr2)
-			return -EINVAL;
-
-		/*
-		 * requeue_pi requires a pi_state, try to allocate it now
-		 * without any locks in case it fails.
-		 */
 		if (refill_pi_state_cache())
 			return -ENOMEM;
-		/*
-		 * requeue_pi must wake as many tasks as it can, up to nr_wake
-		 * + nr_requeue, since it acquires the rt_mutex prior to
-		 * returning to userspace, so as to not leave the rt_mutex with
-		 * waiters and no owner.  However, second and third wake-ups
-		 * cannot be predicted as they involve race conditions with the
-		 * first wake and a fault while looking up the pi_state.  Both
-		 * pthread_cond_signal() and pthread_cond_broadcast() should
-		 * use nr_wake=1.
-		 */
 		if (nr_wake != 1)
 			return -EINVAL;
 	}
 
 retry:
 	if (pi_state != NULL) {
-		/*
-		 * We will have to lookup the pi_state again, so free this one
-		 * to keep the accounting correct.
-		 */
-			free_pi_state(pi_state);
+		free_pi_state(pi_state);
 		pi_state = NULL;
 	}
 
@@ -905,15 +879,6 @@ retry:
 			    requeue_pi ? VERIFY_WRITE : VERIFY_READ);
 	if (unlikely(ret != 0))
 		goto out_put_key1;
-
-	/*
-	 * The check above which compares uaddrs is not sufficient for
-	 * shared futexes. We need to compare the keys:
-	 */
-	if (requeue_pi && match_futex(&key1, &key2)) {
-		ret = -EINVAL;
-		goto out_put_keys;
-	}
 
 	hb1 = hash_futex(&key1);
 	hb2 = hash_futex(&key2);
@@ -1229,7 +1194,7 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 
 	if (likely(!plist_node_empty(&q->list))) {
 		if (!timeout || timeout->task)
-			freezable_schedule();
+			schedule();
 	}
 	__set_current_state(TASK_RUNNING);
 }
@@ -1577,16 +1542,8 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
 	ret = futex_wait_setup(uaddr, val, flags, &q, &hb);
 	if (ret)
 		goto out_key2;
-	/*
-	 * The check above which compares uaddrs is not sufficient for
-	 * shared futexes. We need to compare the keys:
-	 */
-	if (match_futex(&q.key, &key2)) {
-		ret = -EINVAL;
-		goto out_put_keys;
-	}
 
-	/* Queue the futex_q, drop the hb lock, wait for wakeup. */
+	
 	futex_wait_queue_me(hb, &q, to);
 
 	spin_lock(&hb->lock);

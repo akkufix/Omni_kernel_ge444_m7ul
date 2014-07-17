@@ -22,6 +22,7 @@ enum htc_gauge_event {
 	HTC_GAUGE_EVENT_BATT_REMOVED,
 	HTC_GAUGE_EVENT_OVERLOAD,
 	HTC_GAUGE_EVENT_EOC_STOP_CHG,
+	HTC_GAUGE_EVENT_PJ_FULL,
 };
 
 struct htc_gauge {
@@ -33,8 +34,14 @@ struct htc_gauge {
 	int (*get_battery_id)(int *result);
 	int (*get_battery_soc)(int *result);
 	int (*get_battery_cc)(int *result);
+	int (*store_battery_data)(void);
+	int (*store_battery_ui_soc)(int soc_ui);
+	int (*get_battery_ui_soc)(void);
 	int (*is_battery_temp_fault)(int *result);
 	int (*is_battery_full)(int *result);
+	int (*is_pj_full)(int *result);
+	void (*get_pj_voltage)(int *result);
+	int (*calculate_pj_level)(int vol, int is_charging, int batt_temp);
 #if 0
 	int (*dump_all)(void);
 #endif

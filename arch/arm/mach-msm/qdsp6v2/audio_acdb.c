@@ -24,7 +24,7 @@
 #define pr_info(fmt, ...) pr_aud_info(fmt, ##__VA_ARGS__)
 #define pr_err(fmt, ...) pr_aud_err(fmt, ##__VA_ARGS__)
 
-#define MAX_NETWORKS		15
+#define MAX_NETWORKS		12
 
 struct sidetone_atomic_cal {
 	atomic_t	enable;
@@ -872,7 +872,7 @@ done:
 static int acdb_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	int result = 0;
-	int size = vma->vm_end - vma->vm_start;
+	uint32_t size = vma->vm_end - vma->vm_start;
 
 	pr_debug("%s\n", __func__);
 

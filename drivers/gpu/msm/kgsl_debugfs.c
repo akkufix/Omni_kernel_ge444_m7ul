@@ -17,12 +17,27 @@
 #include "kgsl.h"
 #include "kgsl_device.h"
 #include "kgsl_sharedmem.h"
+#include "kgsl_htc.h"
 
 #define KGSL_LOG_LEVEL_MAX     7
 
 struct dentry *kgsl_debugfs_dir;
 static struct dentry *pm_d_debugfs;
 struct dentry *proc_d_debugfs;
+
+static int ctx_dump_set(void* data, u64 val)
+{
+	struct kgsl_device *device = data;
+
+	read_lock(&device->context_lock);
+	kgsl_dump_contextpid_locked(&device->context_idr);
+	read_unlock(&device->context_lock);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(ctx_dump_fops,
+		NULL,
+		ctx_dump_set, "%llu\n");
 
 static int pm_dump_set(void *data, u64 val)
 {
@@ -138,11 +153,6 @@ static int memfree_hist_print(struct seq_file *s, void *unused)
 	p = wptr;
 	for (;;) {
 		kgsl_get_memory_usage(str, sizeof(str), p->flags);
-		/*
-		 * if the ring buffer is not filled up yet
-		 * all its empty elems have size==0
-		 * just skip them ...
-		*/
 		if (p->size)
 			seq_printf(s, "%8d %08x %8d %11s\n",
 				p->pid, p->gpuaddr, p->size, str);
@@ -190,8 +200,10 @@ void kgsl_device_debugfs_init(struct kgsl_device *device)
 				&pwr_log_fops);
 	debugfs_create_file("memfree_history", 0444, device->d_debugfs, device,
 				&memfree_hist_fops);
+	debugfs_create_file("contexpid_dump",  0644, device->d_debugfs, device,
+				&ctx_dump_fops);
 
-	/* Create postmortem dump control files */
+	
 
 	pm_d_debugfs = debugfs_create_dir("postmortem", device->d_debugfs);
 
@@ -275,7 +287,7 @@ static int process_mem_print(struct seq_file *s, void *unused)
 	seq_printf(s, "%8s %8s %5s %5s %10s %16s %5s\n",
 		   "gpuaddr", "size", "id", "flags", "type", "usage", "sglen");
 
-	/* print all entries with a GPU address */
+	
 	spin_lock(&private->mem_lock);
 
 	for (node = rb_first(&private->mem_rb); node; node = rb_next(node)) {
@@ -285,7 +297,7 @@ static int process_mem_print(struct seq_file *s, void *unused)
 
 	spin_unlock(&private->mem_lock);
 
-	/* now print all the unbound entries */
+	
 	while (1) {
 		rcu_read_lock();
 		entry = idr_get_next(&private->mem_idr, &next);
@@ -313,16 +325,37 @@ static const struct file_operations process_mem_fops = {
 	.release = single_release,
 };
 
-void
+int
 kgsl_process_init_debugfs(struct kgsl_process_private *private)
 {
 	unsigned char name[16];
+	int ret = 0;
+	struct dentry *dentry;
 
 	snprintf(name, sizeof(name), "%d", private->pid);
 
 	private->debug_root = debugfs_create_dir(name, proc_d_debugfs);
-	debugfs_create_file("mem", 0400, private->debug_root, private,
+
+	if (!private->debug_root)
+		return -EINVAL;
+
+	private->debug_root->d_inode->i_uid = proc_d_debugfs->d_inode->i_uid;
+	private->debug_root->d_inode->i_gid = proc_d_debugfs->d_inode->i_gid;
+
+	dentry = debugfs_create_file("mem", 0400, private->debug_root, private,
 			    &process_mem_fops);
+
+	if (IS_ERR(dentry)) {
+		ret = PTR_ERR(dentry);
+
+		if (ret == -ENODEV)
+			ret = 0;
+	} else if (dentry) {
+		dentry->d_inode->i_uid = proc_d_debugfs->d_inode->i_uid;
+		dentry->d_inode->i_gid = proc_d_debugfs->d_inode->i_gid;
+	}
+
+	return ret;
 }
 
 void kgsl_core_debugfs_init(void)

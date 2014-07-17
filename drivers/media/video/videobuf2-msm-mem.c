@@ -57,7 +57,7 @@ static unsigned long msm_mem_allocate(struct videobuf2_contig_pmem *mem)
 		goto client_failed;
 	}
 	mem->ion_handle = ion_alloc(mem->client, mem->size, SZ_4K,
-                                    (0x1 << ION_CP_MM_HEAP_ID | 0x1 << ION_IOMMU_HEAP_ID), 0);
+		(0x1 << ION_CP_MM_HEAP_ID | 0x1 << ION_IOMMU_HEAP_ID), 0);
 	if (IS_ERR((void *)mem->ion_handle)) {
 		pr_err("%s Could not allocate\n", __func__);
 		goto alloc_failed;
@@ -65,7 +65,7 @@ static unsigned long msm_mem_allocate(struct videobuf2_contig_pmem *mem)
 	rc = ion_map_iommu(mem->client, mem->ion_handle,
 			CAMERA_DOMAIN, GEN_POOL, SZ_4K, 0,
 			(unsigned long *)&phyaddr,
-			(unsigned long *)&len, 0, 0);
+			(unsigned long *)&len, 0 , 0);
 	if (rc < 0) {
 		pr_err("%s Could not get physical address\n", __func__);
 		goto phys_failed;
@@ -184,7 +184,7 @@ int videobuf2_pmem_contig_user_get(struct videobuf2_contig_pmem *mem,
 		return PTR_ERR(mem->ion_handle);
 	}
 	rc = ion_map_iommu(client, mem->ion_handle, CAMERA_DOMAIN, GEN_POOL,
-		SZ_4K, 0, (unsigned long *)&mem->phyaddr, &len, 0, 0);
+		SZ_4K, 0, (unsigned long *)&mem->phyaddr, &len, 0 , 0);
 	if (rc < 0)
 		ion_free(client, mem->ion_handle);
 
@@ -350,6 +350,8 @@ unsigned long videobuf2_to_pmem_contig(struct vb2_buffer *vb,
 	mem = vb2_plane_cookie(vb, plane_no);
 	BUG_ON(!mem);
 	MAGIC_CHECK(mem->magic, MAGIC_PMEM);
+	if (!mem->mapped_phyaddr)
+		pr_err("%s mem->mapped_phyaddr is null", __func__);
 	return mem->mapped_phyaddr;
 }
 EXPORT_SYMBOL_GPL(videobuf2_to_pmem_contig);

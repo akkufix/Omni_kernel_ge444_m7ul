@@ -84,11 +84,13 @@ struct msm_fb_data_type {
 
 	struct device *dev;
 	boolean op_enable;
-	struct delayed_work backlight_worker;
 	uint32 fb_imgType;
 	boolean sw_currently_refreshing;
 	boolean sw_refreshing_enable;
 	boolean hw_refresh;
+	
+	boolean init_mipi_lcd;
+	
 #ifdef CONFIG_FB_MSM_OVERLAY
 	int overlay_play_enable;
 #endif
@@ -101,7 +103,7 @@ struct msm_fb_data_type {
 	boolean pan_waiting;
 	struct completion pan_comp;
 
-	/* vsync */
+	
 	boolean use_mdp_vsync;
 	__u32 vsync_gpio;
 	__u32 total_lcd_lines;
@@ -112,6 +114,7 @@ struct msm_fb_data_type {
 	struct hrtimer dma_hrtimer;
 
 	boolean panel_power_on;
+	boolean request_display_on;
 	struct work_struct dma_update_worker;
 	struct semaphore sem;
 
@@ -166,6 +169,9 @@ struct msm_fb_data_type {
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	struct early_suspend early_suspend;
+#ifdef CONFIG_HTC_ONMODE_CHARGING
+	struct early_suspend onchg_suspend;
+#endif
 #ifdef CONFIG_FB_MSM_MDDI
 	struct early_suspend mddi_early_suspend;
 	struct early_suspend mddi_ext_early_suspend;
@@ -208,13 +214,9 @@ struct msm_fb_data_type {
 	u32 last_acq_fen_cnt;
 	struct sync_fence *last_acq_fen[MDP_MAX_FENCE_FD];
 	struct mutex sync_mutex;
-	struct mutex queue_mutex;
 	struct completion commit_comp;
 	u32 is_committing;
-	atomic_t commit_cnt;
-	struct task_struct *commit_thread;
-	wait_queue_head_t commit_queue;
-	int wake_commit_thread;
+	struct work_struct commit_work;
 	void *msm_fb_backup;
 	boolean panel_driver_on;
 	int vsync_sysfs_created;
@@ -222,13 +224,13 @@ struct msm_fb_data_type {
 	unsigned char *copy_splash_phys;
 	uint32 sec_mapped;
 	uint32 sec_active;
-
+	
 	struct workqueue_struct *dimming_wq;
 	struct work_struct dimming_work;
 	struct timer_list dimming_update_timer;
 	struct workqueue_struct *sre_wq;
-        struct work_struct sre_work;
-        struct timer_list sre_update_timer;
+	struct work_struct sre_work;
+	struct timer_list sre_update_timer;
 };
 struct msm_fb_backup_type {
 	struct fb_info info;
@@ -255,8 +257,8 @@ int calc_fb_offset(struct msm_fb_data_type *mfd, struct fb_info *fbi, int bpp);
 void msm_fb_wait_for_fence(struct msm_fb_data_type *mfd);
 int msm_fb_signal_timeline(struct msm_fb_data_type *mfd);
 void msm_fb_release_timeline(struct msm_fb_data_type *mfd);
-void msm_fb_release_busy(struct msm_fb_data_type *mfd);
 void mdp_color_enhancement(const struct mdp_reg *reg_seq, int size);
+int msm_fb_mixer_pan_idle(DISP_TARGET_PHYS pdest);
 
 #ifdef CONFIG_FB_BACKLIGHT
 void msm_fb_config_backlight(struct msm_fb_data_type *mfd);
@@ -271,4 +273,5 @@ int msm_fb_check_frame_rate(struct msm_fb_data_type *mfd,
 int load_565rle_image(char *filename, bool bf_supported);
 #endif
 
-#endif /* MSM_FB_H */
+#define DEFAULT_BRIGHTNESS 143
+#endif 

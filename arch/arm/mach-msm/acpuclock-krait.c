@@ -33,7 +33,6 @@
 #include <mach/rpm-regulator.h>
 #include <mach/rpm-regulator-smd.h>
 #include <mach/msm_bus.h>
-#include <mach/msm_dcvs.h>
 
 #include "acpuclock.h"
 #include "acpuclock-krait.h"
@@ -61,11 +60,121 @@ static void set_acpuclk_L2_freq_foot_print(unsigned khz)
 	mb();
 }
 
+#ifdef CONFIG_ACPU_CUSTOM_FREQ_SUPPORT
+static unsigned long acpu_max_freq = CONFIG_ACPU_MAX_FREQ;
+#endif
+
 #define PRI_SRC_SEL_SEC_SRC	0
 #define PRI_SRC_SEL_HFPLL	1
 #define PRI_SRC_SEL_HFPLL_DIV2	2
 
 #define SECCLKAGD		BIT(4)
+
+/** elementalx defs  **/
+
+static int uv_bin = 0;
+static uint32_t arg_max_oc0 = 1728000;
+static uint32_t arg_max_oc1 = 1728000;
+static uint32_t arg_max_oc2 = 1728000;
+static uint32_t arg_max_oc3 = 1728000;
+
+int pvs_number = 0;
+module_param(pvs_number, int, 0755); 
+
+/* boot arg max_oc */
+static int __init cpufreq_read_arg_max_oc0(char *max_oc0)
+{
+	unsigned long ui_khz;
+	int err;
+	err = strict_strtoul(max_oc0, 0, &ui_khz);
+	if (err) {
+		arg_max_oc0 = 1728000;
+		printk(KERN_INFO "[elementalx]: max_oc0='%i'\n", arg_max_oc0);
+		return 1;
+	}
+	
+	arg_max_oc0 = ui_khz;
+	
+	return 0;
+}
+__setup("oc0=", cpufreq_read_arg_max_oc0);
+
+static int __init cpufreq_read_arg_max_oc1(char *max_oc1)
+{
+	unsigned long ui_khz;
+	int err;
+	err = strict_strtoul(max_oc1, 0, &ui_khz);
+	if (err) {
+		arg_max_oc1 = 1728000;
+		printk(KERN_INFO "[elementalx]: max_oc1='%i'\n", arg_max_oc1);
+		return 1;
+	}
+	
+	arg_max_oc1 = ui_khz;
+	
+	return 0;
+}
+__setup("oc1=", cpufreq_read_arg_max_oc1);
+
+static int __init cpufreq_read_arg_max_oc2(char *max_oc2)
+{
+	unsigned long ui_khz;
+	int err;
+	err = strict_strtoul(max_oc2, 0, &ui_khz);
+	if (err) {
+		arg_max_oc2 = 1728000;
+		printk(KERN_INFO "[elementalx]: max_oc2='%i'\n", arg_max_oc2);
+		return 1;
+	}
+	
+	arg_max_oc2 = ui_khz;
+	
+	return 0;
+}
+__setup("oc2=", cpufreq_read_arg_max_oc2);
+
+static int __init cpufreq_read_arg_max_oc3(char *max_oc3)
+{
+	unsigned long ui_khz;
+	int err;
+	err = strict_strtoul(max_oc3, 0, &ui_khz);
+	if (err) {
+		arg_max_oc3 = 1728000;
+		printk(KERN_INFO "[elementalx]: max_oc3='%i'\n", arg_max_oc3);
+		return 1;
+	}
+	
+	arg_max_oc3 = ui_khz;
+	
+	return 0;
+}
+__setup("oc3=", cpufreq_read_arg_max_oc3);
+
+static int __init get_uv_level(char *vdd_uv)
+{
+	if (strcmp(vdd_uv, "0") == 0) {
+		uv_bin = 0;
+	} else if (strcmp(vdd_uv, "1") == 0) {
+		uv_bin = 1;
+	} else if (strcmp(vdd_uv, "2") == 0) {
+		uv_bin = 2;
+	} else if (strcmp(vdd_uv, "3") == 0) {
+		uv_bin = 3;
+	} else if (strcmp(vdd_uv, "4") == 0) {
+		uv_bin = 4;
+	} else if (strcmp(vdd_uv, "5") == 0) {
+		uv_bin = 5;
+	} else if (strcmp(vdd_uv, "6") == 0) {
+		uv_bin = 6;
+	} else {
+		uv_bin = 0;
+	}
+	return 0;
+}
+
+__setup("uv=", get_uv_level); 
+
+/** end elementalx defs  **/
 
 static DEFINE_MUTEX(driver_lock);
 static DEFINE_SPINLOCK(l2_lock);
@@ -537,15 +646,17 @@ static int acpuclk_krait_set_rate(int cpu, unsigned long rate,
 	if (prev_l2_src == HFPLL)
 		disable_l2_regulators();
 
+	set_acpuclk_foot_print(cpu, 0x7);
+
 	
 	set_bus_bw(drv.l2_freq_tbl[tgt_l2_l].bw_level);
 
-	set_acpuclk_foot_print(cpu, 0x7);
+	set_acpuclk_foot_print(cpu, 0x8);
 
 	
 	decrease_vdd(cpu, &vdd_data, reason);
 
-	set_acpuclk_foot_print(cpu, 0x8);
+	set_acpuclk_foot_print(cpu, 0x9);
 
 	
 	if (reason == SETRATE_CPUFREQ && tgt->avsdscr_setting) {
@@ -559,7 +670,7 @@ out:
 	if (reason == SETRATE_CPUFREQ || reason == SETRATE_HOTPLUG)
 		mutex_unlock(&driver_lock);
 
-	set_acpuclk_foot_print(cpu, 0x9);
+	set_acpuclk_foot_print(cpu, 0xA);
 
 	return rc;
 }
@@ -886,72 +997,68 @@ static void __init bus_init(const struct l2_level *l2_level)
 		dev_err(drv.dev, "initial bandwidth req failed (%d)\n", ret);
 }
 
-#ifdef CONFIG_USERSPACE_VOLTAGE_CONTROL
+#ifdef CONFIG_CPU_VOLTAGE_TABLE
 
-#define USERCONTROL_MIN_VDD		 700
-#define USERCONTROL_MAX_VDD		1350
-#define NUM_FREQS			21
+#define HFPLL_MIN_VDD		 700000
+#define HFPLL_MAX_VDD		1350000
 
 ssize_t acpuclk_get_vdd_levels_str(char *buf) {
 
 	int i, len = 0;
 
 	if (buf) {
+		mutex_lock(&driver_lock);
+
 		for (i = 0; drv.acpu_freq_tbl[i].speed.khz; i++) {
-			if (drv.acpu_freq_tbl[i].use_for_scaling) {
-				len += sprintf(buf + len, "%lumhz: %i mV\n", drv.acpu_freq_tbl[i].speed.khz/1000,
-						drv.acpu_freq_tbl[i].vdd_core/1000 );
-			}
+			/* updated to use uv required by 8x60 architecture */
+			len += sprintf(buf + len, "%8lu: %8d\n", drv.acpu_freq_tbl[i].speed.khz,
+				drv.acpu_freq_tbl[i].vdd_core );
 		}
+
+		mutex_unlock(&driver_lock);
 	}
 	return len;
 }
 
-ssize_t acpuclk_set_vdd(char *buf) {
+/* updated to use uv required by 8x60 architecture */
+void acpuclk_set_vdd(unsigned int khz, int vdd_uv) {
 
-        int i = 0;
-        unsigned long volt_cur[NUM_FREQS] = {0};
-        int ret = 0;
+	int i;
+	unsigned int new_vdd_uv;
 
-	if (buf) {
-		ret = sscanf(buf, "%lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",// %lu", // %lu",
-				&volt_cur[0], &volt_cur[1], &volt_cur[2], &volt_cur[3], &volt_cur[4], &volt_cur[5], &volt_cur[6], &volt_cur[7], &volt_cur[8],
-				&volt_cur[9], &volt_cur[10], &volt_cur[11], &volt_cur[12], &volt_cur[13],&volt_cur[14], &volt_cur[15], &volt_cur[16], &volt_cur[17], &volt_cur[18], &volt_cur[19], &volt_cur[20]);
+	mutex_lock(&driver_lock);
 
+	for (i = 0; drv.acpu_freq_tbl[i].speed.khz; i++) {
+		if (khz == 0)
+			new_vdd_uv = min(max((unsigned int)(drv.acpu_freq_tbl[i].vdd_core + vdd_uv),
+				(unsigned int)HFPLL_MIN_VDD), (unsigned int)HFPLL_MAX_VDD);
+		else if ( drv.acpu_freq_tbl[i].speed.khz == khz)
+			new_vdd_uv = min(max((unsigned int)vdd_uv,
+				(unsigned int)HFPLL_MIN_VDD), (unsigned int)HFPLL_MAX_VDD);
+		else 
+			continue;
 
-		if (ret != NUM_FREQS)
-			return -EINVAL;
-
-		for(i = 0; i < NUM_FREQS; i++) {
-			if(drv.acpu_freq_tbl[i].speed.khz != 0) {
-
-				if (volt_cur[i] < (unsigned long) USERCONTROL_MIN_VDD)
-					volt_cur[i] = (unsigned long) USERCONTROL_MIN_VDD;
-                                if (volt_cur[i] > (unsigned long) USERCONTROL_MAX_VDD)
-                                        volt_cur[i] = (unsigned long) USERCONTROL_MAX_VDD;
-
-				drv.acpu_freq_tbl[i].vdd_core = volt_cur[i]*1000;
-
-			}
-		}
+		drv.acpu_freq_tbl[i].vdd_core = new_vdd_uv;
 	}
-	return ret;
+	pr_warn("VDD: user voltage table modified!\n");
+	mutex_unlock(&driver_lock);
 }
-#endif
+#endif	/* CONFIG_CPU_VOTALGE_TABLE */
 
 #ifdef CONFIG_CPU_FREQ_MSM
-static struct cpufreq_frequency_table freq_table[NR_CPUS][39];
+static struct cpufreq_frequency_table freq_table[NR_CPUS][35];
 
 static void __init cpufreq_table_init(void)
 {
 	int cpu;
+	uint32_t limit_max_oc[4] = {arg_max_oc0, arg_max_oc1, arg_max_oc2, arg_max_oc3};
 
 	for_each_possible_cpu(cpu) {
 		int i, freq_cnt = 0;
 		
 		for (i = 0; drv.acpu_freq_tbl[i].speed.khz != 0
 				&& freq_cnt < ARRAY_SIZE(*freq_table); i++) {
-			if (drv.acpu_freq_tbl[i].use_for_scaling) {
+			if (drv.acpu_freq_tbl[i].speed.khz <= limit_max_oc[cpu]) {
 				freq_table[cpu][freq_cnt].index = freq_cnt;
 				freq_table[cpu][freq_cnt].frequency
 					= drv.acpu_freq_tbl[i].speed.khz;
@@ -974,17 +1081,6 @@ static void __init cpufreq_table_init(void)
 #else
 static void __init cpufreq_table_init(void) {}
 #endif
-
-static void __init dcvs_freq_init(void)
-{
-	int i;
-
-	for (i = 0; drv.acpu_freq_tbl[i].speed.khz != 0; i++)
-		if (drv.acpu_freq_tbl[i].use_for_scaling)
-			msm_dcvs_register_cpu_freq(
-				drv.acpu_freq_tbl[i].speed.khz,
-				drv.acpu_freq_tbl[i].vdd_core / 1000);
-}
 
 static int __cpuinit acpuclk_cpu_callback(struct notifier_block *nfb,
 					    unsigned long action, void *hcpu)
@@ -1049,6 +1145,39 @@ static void krait_apply_vmin(struct acpu_level *tbl)
 	}
 }
 
+static void apply_undervolting(struct acpu_level *tbl)
+{
+	if (uv_bin == 6) {
+		tbl[0].vdd_core = 725000;
+	        printk(KERN_INFO "[elementalx]: min_voltage='%i'\n", tbl[0].vdd_core );
+	}
+
+	if (uv_bin == 5) {
+		tbl[0].vdd_core = 750000;
+	        printk(KERN_INFO "[elementalx]: min_voltage='%i'\n", tbl[0].vdd_core );
+	}
+
+	if (uv_bin == 4) {
+		tbl[0].vdd_core = 775000;
+	        printk(KERN_INFO "[elementalx]: min_voltage='%i'\n", tbl[0].vdd_core );
+	}
+
+	if (uv_bin == 3) {
+		tbl[0].vdd_core = 800000;
+	        printk(KERN_INFO "[elementalx]: min_voltage='%i'\n", tbl[0].vdd_core );
+	}
+
+	if (uv_bin == 2) {
+		tbl[0].vdd_core = 825000;
+	        printk(KERN_INFO "[elementalx]: min_voltage='%i'\n", tbl[0].vdd_core );
+	}
+
+	if (uv_bin == 1) {
+		tbl[0].vdd_core = 850000;
+		printk(KERN_INFO "[elementalx]: min_voltage='%i'\n", tbl[0].vdd_core );
+	}
+}
+
 uint32_t global_speed_bin;
 int __init get_speed_bin(u32 pte_efuse)
 {
@@ -1088,8 +1217,18 @@ static int __init get_pvs_bin(u32 pte_efuse)
 	} else {
 		dev_info(drv.dev, "ACPU PVS: %d\n", pvs_bin);
 	}
+	
+	pvs_number = pvs_bin;
 
 	return pvs_bin;
+}
+
+static int speed_bin_filter = 0;
+static unsigned long speed_bin_freq = 0;
+void set_acpu_speedbin_filter_freq(int bin, unsigned long freq)
+{
+	speed_bin_filter = bin;
+	speed_bin_freq = freq;
 }
 
 static struct pvs_table * __init select_freq_plan(u32 pte_efuse_phys,
@@ -1097,6 +1236,10 @@ static struct pvs_table * __init select_freq_plan(u32 pte_efuse_phys,
 {
 	void __iomem *pte_efuse;
 	u32 pte_efuse_val;
+#ifdef CONFIG_ACPU_CUSTOM_FREQ_SUPPORT
+	struct pvs_table *pvs;
+	struct acpu_level *l;
+#endif
 
 	pte_efuse = ioremap(pte_efuse_phys, 4);
 	if (!pte_efuse) {
@@ -1111,7 +1254,32 @@ static struct pvs_table * __init select_freq_plan(u32 pte_efuse_phys,
 	drv.speed_bin = get_speed_bin(pte_efuse_val);
 	drv.pvs_bin = get_pvs_bin(pte_efuse_val);
 
+#ifdef CONFIG_ACPU_SPEED_BIN_FREQ_SUPPORT
+	if ((speed_bin_freq!=0) && (drv.speed_bin == speed_bin_filter))
+		acpu_max_freq = speed_bin_freq;
+#endif
+
+#ifdef CONFIG_ACPU_CUSTOM_FREQ_SUPPORT
+	pvs = &pvs_tables[drv.speed_bin][drv.pvs_bin];
+	BUG_ON(!pvs->table);
+
+	
+	if (acpu_max_freq) {
+		for (l = pvs->table; l->speed.khz != 0; l++) {
+			if (l->speed.khz >= acpu_max_freq) {
+				if(l->speed.khz == acpu_max_freq)
+					l++;
+				for (; l->speed.khz != 0; l++)
+					l->use_for_scaling = 0;
+				break;
+			}
+		}
+	}
+
+	return pvs;
+#else
 	return &pvs_tables[drv.speed_bin][drv.pvs_bin];
+#endif
 }
 
 static void __init drv_data_init(struct device *dev,
@@ -1160,6 +1328,9 @@ static void __init hw_init(void)
 	if (krait_needs_vmin())
 		krait_apply_vmin(drv.acpu_freq_tbl);
 
+	if (uv_bin)
+		apply_undervolting(drv.acpu_freq_tbl);
+
 	l2->hfpll_base = ioremap(l2->hfpll_phys_base, SZ_32);
 	BUG_ON(!l2->hfpll_base);
 
@@ -1198,7 +1369,6 @@ int __init acpuclk_krait_init(struct device *dev,
 	hw_init();
 
 	cpufreq_table_init();
-	dcvs_freq_init();
 	acpuclk_register(&acpuclk_krait_data);
 	register_hotcpu_notifier(&acpuclk_cpu_notifier);
 

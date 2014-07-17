@@ -5,7 +5,6 @@
 # Rewritten to use lists instead of if-statements.
 #
 
-obj-$(CONFIG_CPUQUIET_FRAMEWORK)+= cpuquiet/
 # GPIO must come after pinctrl as gpios may need to mux pins etc
 obj-y				+= pinctrl/
 obj-y				+= gpio/
@@ -144,3 +143,6 @@ obj-$(CONFIG_PM_DEVFREQ)	+= devfreq/
 obj-$(CONFIG_MOBICORE_SUPPORT)  += gud/
 
 obj-$(CONFIG_MSM_QDSS)		+= coresight/
+
+# htc stability files
+obj-y += htc_debug/stability/

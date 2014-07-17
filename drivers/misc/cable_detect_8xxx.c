@@ -158,6 +158,7 @@ int cable_detect_register_notifier(struct t_cable_status_notifier *notifier)
 	return 0;
 }
 
+#if (defined(CONFIG_USB_OTG) && defined(CONFIG_USB_OTG_HOST))
 static DEFINE_MUTEX(usb_host_notify_sem);
 static void send_usb_host_connect_notify(int cable_in)
 {
@@ -189,6 +190,7 @@ int usb_host_detect_register_notifier(struct t_usb_host_status_notifier *notifie
 	mutex_unlock(&usb_host_notify_sem);
 	return 0;
 }
+#endif
 
 static void check_vbus_in(struct work_struct *w)
 {
@@ -216,7 +218,6 @@ static void check_vbus_in(struct work_struct *w)
 			&pInfo->cable_detect_work, ADC_DELAY);
 	}
 #endif
-
 	if (pInfo->notify_init == 0 && vbus_in == 0 && vbus == 0)
 		send_cable_connect_notify(CONNECT_TYPE_NONE);
 	if (pInfo->notify_init == 0 && vbus == vbus_in)
@@ -318,7 +319,11 @@ static int cable_detect_get_type(struct cable_detect_info *pInfo)
 		if (adc > -100 && adc < 100)
 			type = second_detect(pInfo);
 		else {
+#ifdef CONFIG_MACH_T6_UL
+			if (adc > 120 && adc < 220)
+#else
 			if (adc > 150 && adc < 220)
+#endif
 				type = DOCK_STATE_CAR;
 			else if (adc > 370 && adc < 440)
 				type = DOCK_STATE_USB_HEADSET;
@@ -352,7 +357,6 @@ static void cable_detect_handler(struct work_struct *w)
 			w, struct cable_detect_info, cable_detect_work.work);
 	int value;
 	int accessory_type;
-
 	if (pInfo == NULL)
 		return;
 	if(pInfo->audio_dock_lock == 1) {
@@ -372,7 +376,6 @@ static void cable_detect_handler(struct work_struct *w)
 		}
 	} else
 		accessory_type = DOCK_STATE_UNDOCKED;
-
 #ifdef CONFIG_FB_MSM_HDMI_MHL_SII9234
 	if (pInfo->mhl_reset_gpio != 0)
 		gpio_set_value_cansleep(pInfo->mhl_reset_gpio, 1); 
@@ -426,12 +429,14 @@ static void cable_detect_handler(struct work_struct *w)
 		sii9234_mhl_device_wakeup();
 		break;
 #endif
+#if (defined(CONFIG_USB_OTG) && defined(CONFIG_USB_OTG_HOST))
 	case DOCK_STATE_USB_HOST:
 		CABLE_INFO("USB Host inserted\n");
 		send_usb_host_connect_notify(1);
 		pInfo->accessory_type = DOCK_STATE_USB_HOST;
 		switch_set_state(&dock_switch, DOCK_STATE_USB_HOST);
 		break;
+#endif
 	case DOCK_STATE_DMB:
 		CABLE_INFO("DMB inserted\n");
 		send_cable_connect_notify(CONNECT_TYPE_CLEAR);
@@ -456,6 +461,14 @@ static void cable_detect_handler(struct work_struct *w)
 #endif
 #endif
 		break;
+#ifdef CONFIG_USB_OTG_HOST_CHG
+	case DOCK_STATE_HOST_CHG_DOCK:
+		CABLE_INFO("USB Host charger inserted\n");
+		send_usb_host_connect_notify(1);
+		pInfo->accessory_type = DOCK_STATE_HOST_CHG_DOCK;
+		switch_set_state(&dock_switch, DOCK_STATE_USB_HOST);
+		break;
+#endif
 	case DOCK_STATE_UNDEFINED:
 	case DOCK_STATE_UNDOCKED:
 		switch (pInfo->accessory_type) {
@@ -485,12 +498,14 @@ static void cable_detect_handler(struct work_struct *w)
 			sii9234_disableIRQ();
 			break;
 #endif
+#if (defined(CONFIG_USB_OTG) && defined(CONFIG_USB_OTG_HOST))
 		case DOCK_STATE_USB_HOST:
 			CABLE_INFO("USB host cable removed\n");
 			pInfo->accessory_type = DOCK_STATE_UNDOCKED;
 			send_usb_host_connect_notify(0);
 			switch_set_state(&dock_switch, DOCK_STATE_UNDOCKED);
 			break;
+#endif
 		case DOCK_STATE_DMB:
 			CABLE_INFO("DMB removed\n");
 			switch_set_state(&dock_switch, DOCK_STATE_UNDOCKED);
@@ -504,6 +519,13 @@ static void cable_detect_handler(struct work_struct *w)
 #endif
 			pInfo->accessory_type = DOCK_STATE_UNDOCKED;
 			break;
+#ifdef CONFIG_USB_OTG_HOST_CHG
+		case DOCK_STATE_HOST_CHG_DOCK:
+			CABLE_INFO("USB host charger removed\n");
+			send_usb_host_connect_notify(0);
+			switch_set_state(&dock_switch, DOCK_STATE_UNDOCKED);
+			break;
+#endif
 		}
 	default :
 		break;
@@ -586,9 +608,17 @@ static int second_detect(struct cable_detect_info *pInfo)
 		type = DOCK_STATE_UNDEFINED;
 #endif
 	else if(adc_value >= 1021 && adc_value <= 1224)
+#ifdef CONFIG_USB_OTG_HOST_CHG
+		type = DOCK_STATE_HOST_CHG_DOCK;
+#else
 		type = DOCK_STATE_AUDIO_DOCK;
+#endif
 	else
+#if (defined(CONFIG_USB_OTG) && defined(CONFIG_USB_OTG_HOST))
 		type = DOCK_STATE_USB_HOST;
+#else
+		type = DOCK_STATE_UNDEFINED;
+#endif
 
 	if (pInfo->config_usb_id_gpios)
 		pInfo->config_usb_id_gpios(0);
@@ -631,8 +661,13 @@ static irqreturn_t usbid_interrupt(int irq, void *data)
 
 	CABLE_INFO("usb: id interrupt\n");
 	pInfo->cable_redetect = 0;
+#ifdef CONFIG_USB_OTG_HOST_CHG
+	queue_delayed_work(pInfo->cable_detect_wq,
+		&pInfo->cable_detect_work, HOST_DET_DELAY);
+#else
 	queue_delayed_work(pInfo->cable_detect_wq,
 		&pInfo->cable_detect_work, ADC_DELAY);
+#endif
 	wake_lock_timeout(&pInfo->cable_detect_wlock, HZ*2);
 	return IRQ_HANDLED;
 }
@@ -1037,7 +1072,7 @@ static void usb_status_notifier_func(int cable_type)
 	struct cable_detect_info*pInfo = &the_cable_info;
 
 	CABLE_INFO("%s: cable_type = %d\n", __func__, cable_type);
-
+#ifndef CONFIG_USB_OTG_HOST_CHG
 	
 	if(pInfo->audio_dock_lock == 0 && (cable_type == CONNECT_TYPE_USB || cable_type == CONNECT_TYPE_AC || cable_type == CONNECT_TYPE_MHL_AC))
 		if(pInfo->accessory_type == DOCK_STATE_AUDIO_DOCK) {
@@ -1054,7 +1089,7 @@ static void usb_status_notifier_func(int cable_type)
 			}
 #endif
 		}
-
+#endif
 	if (cable_type > CONNECT_TYPE_NONE ||
 			cable_type == CONNECT_TYPE_UNKNOWN) {
 		if (pInfo->ad_en_gpio) {

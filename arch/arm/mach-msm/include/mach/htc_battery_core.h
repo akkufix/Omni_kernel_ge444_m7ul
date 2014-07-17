@@ -51,16 +51,29 @@ enum {
 	OVER_VCHG,
 	BATT_STATE,
 	OVERLOAD,
+	PJ_EXIST,
+	PJ_STATUS,
+	PJ_LEVEL,
+	BATT_CABLEIN,
 };
 
 enum htc_batt_rt_attr {
 	HTC_BATT_RT_VOLTAGE = 0,
 	HTC_BATT_RT_CURRENT,
 	HTC_BATT_RT_TEMPERATURE,
+	HTC_PJ_RT_EXISTS,
+	HTC_PJ_RT_VOLTAGE,
+	HTC_BATT_RT_VOLTAGE_UV,
 };
 
 struct battery_info_reply {
 	u32 batt_vol;
+	u32 pj_vol;
+	u32 pj_src;
+	u32 pj_chg_status;
+	u32 pj_full;
+	s32 pj_level;
+	s32 pj_level_pre;
 	u32 batt_id;
 	s32 batt_temp;
 	s32 batt_current;
@@ -71,6 +84,7 @@ struct battery_info_reply {
 	u32 charging_enabled;
 	u32 full_bat;
 	u32 full_level;
+	u32 full_level_dis_batt_chg;
 	u32 over_vchg;
 	s32 temp_fault;
 	u32 batt_state;
@@ -86,8 +100,10 @@ struct htc_battery_core {
 	int (*func_charger_control)(enum charger_control_flag);
 	int (*func_context_event_handler)(enum batt_context_event);
 	void (*func_set_full_level)(int full_level);
+	void (*func_set_full_level_dis_batt_chg)(int full_level_dis_batt_chg);
 	int (*func_set_max_input_current)(int target_ma);
 	int (*func_notify_pnpmgr_charging_enabled)(int charging_enabled);
+	void (*func_trigger_store_battery_data)(int trigger_flag);
 };
 #ifdef CONFIG_HTC_BATT_CORE
 extern int htc_battery_core_update_changed(void);

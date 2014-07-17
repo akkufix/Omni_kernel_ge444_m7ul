@@ -1,7 +1,7 @@
 /* arch/arm/mach-msm/include/mach/board.h
  *
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2008-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2008-2012, Code Aurora Forum. All rights reserved.
  * Author: Brian Swetland <swetland@google.com>
  *
  * This software is licensed under the terms of the GNU General Public
@@ -338,6 +338,7 @@ struct msm_camera_sensor_platform_info {
 	void *privacy_light_info;
 	enum sensor_mount_angle sensor_mount_angle; 
 	bool ews_enable;
+	bool board_control_reset_pin;
 	
 };
 
@@ -425,6 +426,7 @@ struct msm_camera_sensor_info {
 	struct msm_camera_gpio_conf *gpio_conf;
 	int (*camera_power_on)(void);
 	int (*camera_power_off)(void);
+
 	void (*camera_yushanii_probed)(enum htc_camera_image_type_board);
 	enum htc_camera_image_type_board htc_image;	
 	int use_rawchip;
@@ -449,7 +451,8 @@ struct msm_camera_sensor_info {
 #endif
 	
 	int sensor_cut;
-
+	int dual_camera; 
+    struct clk* main_clk;
 };
 
 struct msm_camera_board_info {
@@ -540,25 +543,30 @@ struct msm_panel_common_pdata {
 	void (*panel_config_gpio)(int);
 	int (*vga_switch)(int select_vga);
 	int *gpio_num;
+#ifdef CONFIG_FB_MSM_412
 	int mdp_core_clk_rate;
 	unsigned num_mdp_clk;
 	int *mdp_core_clk_table;
 	u32 mdp_max_clk;
+	u32 mdp_min_clk;
+#else
+	u32 mdp_max_clk;
 	u32 mdp_max_bw;
 	u32 mdp_bw_ab_factor;
 	u32 mdp_bw_ib_factor;
+#endif
+
 #ifdef CONFIG_MSM_BUS_SCALING
 	struct msm_bus_scale_pdata *mdp_bus_scale_table;
 #endif
 	int mdp_rev;
-	u32 ov0_wb_size;  /* overlay0 writeback size */
-	u32 ov1_wb_size;  /* overlay1 writeback size */
+	u32 ov0_wb_size;  
+	u32 ov1_wb_size;  
 	u32 mem_hid;
 	char cont_splash_enabled;
 	u32 splash_screen_addr;
 	u32 splash_screen_size;
 	char mdp_iommu_split_domain;
-	u32 avtimer_phy;
 	int (*mdp_color_enhance)(void);
 	int (*mdp_gamma)(void);
 };
@@ -596,6 +604,7 @@ struct mipi_dsi_platform_data {
 	int (*get_lane_config)(void);
 	char (*splash_is_enabled)(void);
 	int target_type;
+	int (*deferred_reset_driver_ic)(void);
 };
 
 enum mipi_dsi_3d_ctrl {
@@ -625,6 +634,7 @@ struct mipi_dsi_panel_platform_data {
 	void (*dsi_pwm_cfg)(void);
 	char enable_wled_bl_ctrl;
 	void (*gpio_set_backlight)(int bl_level);
+	unsigned char (*shrink_pwm)(int val);
 };
 
 struct lvds_panel_platform_data {
@@ -645,6 +655,13 @@ struct msm_fb_platform_data {
 	char ext_panel_name[PANEL_NAME_MAX_LEN];
 };
 
+#define HDMI_VFRMT_640x480p60_4_3 0
+#define HDMI_VFRMT_720x480p60_16_9 2
+#define HDMI_VFRMT_1280x720p60_16_9 3
+#define HDMI_VFRMT_720x576p50_16_9 17
+#define HDMI_VFRMT_1920x1080p24_16_9 31
+#define HDMI_VFRMT_1920x1080p30_16_9 33
+
 typedef struct
 {
 	uint8_t format;
@@ -663,7 +680,6 @@ struct msm_hdmi_platform_data {
 	int (*gpio_config)(int on);
 	int (*init_irq)(void);
 	bool (*check_hdcp_hw_support)(void);
-	bool (*source)(void);
 	bool is_mhl_enabled;
 	mhl_driving_params *driving_params;
 	int dirving_params_count;
@@ -710,7 +726,6 @@ struct msm_vidc_platform_data {
 	int disable_fullhd;
 	u32 cp_enabled;
 	u32 secure_wb_heap;
-	u32 enable_sec_metadata;
 #ifdef CONFIG_MSM_BUS_SCALING
 	struct msm_bus_scale_pdata *vidc_bus_client_pdata;
 #endif
@@ -772,6 +787,7 @@ int msm_add_host(unsigned int host,
 void msm_hsusb_set_vbus_state(int online);
 void msm_otg_set_vbus_state(int online);
 enum usb_connect_type {
+	CONNECT_TYPE_NOTIFY = -3,
 	CONNECT_TYPE_CLEAR = -2,
 	CONNECT_TYPE_UNKNOWN = -1,
 	CONNECT_TYPE_NONE = 0,
@@ -824,6 +840,7 @@ struct t_mhl_status_notifier{
 int mhl_detect_register_notifier(struct t_mhl_status_notifier *);
 static LIST_HEAD(g_lh_mhl_detect_notifier_list);
 
+#if (defined(CONFIG_USB_OTG) && defined(CONFIG_USB_OTG_HOST))
 struct t_usb_host_status_notifier{
 	struct list_head usb_host_notifier_link;
 	const char *name;
@@ -831,6 +848,7 @@ struct t_usb_host_status_notifier{
 };
 int usb_host_detect_register_notifier(struct t_usb_host_status_notifier *);
 static LIST_HEAD(g_lh_usb_host_detect_notifier_list);
+#endif
 
 int board_mfg_mode(void);
 int board_fullramdump_flag(void);
@@ -854,4 +872,7 @@ extern int dying_processors_read_proc(char *page, char **start, off_t off,
 			   int count, int *eof, void *data);
 
 extern int get_partition_num_by_name(char *name);
+
+static DEFINE_MUTEX(function_bind_sem);
+
 #endif

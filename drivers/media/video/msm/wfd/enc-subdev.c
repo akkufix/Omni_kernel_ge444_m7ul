@@ -272,7 +272,7 @@ static long venc_open(struct v4l2_subdev *sd, void *arg)
 	int flags = 0;
 	mutex_lock(&venc_p.lock);
 	client_index = venc_get_empty_client_index();
-	if (client_index < 0) {
+	if ((s32)client_index < 0) {
 		WFD_MSG_ERR("No free clients, client_index = %d\n",
 				client_index);
 		rc = -ENODEV;
@@ -1406,7 +1406,7 @@ static long venc_set_vui_timing_info(struct video_client_ctx *client_ctx,
 	if (!client_ctx)
 		return -EINVAL;
 	if (inst->framerate_mode == VENC_MODE_VFR) {
-		WFD_MSG_INFO("VUI timing info not suported in VFR mode ");
+		WFD_MSG_ERR("VUI timing info not suported in VFR mode ");
 		return -EINVAL;
 	}
 	vcd_property_hdr.prop_id = VCD_I_ENABLE_VUI_TIMING_INFO;
@@ -2010,7 +2010,8 @@ static long venc_alloc_recon_buffers(struct v4l2_subdev *sd, void *arg)
 	struct vcd_property_enc_recon_buffer *ctrl = NULL;
 	unsigned long phy_addr;
 	int i = 0;
-	int flags = 0;
+	int heap_mask = 0;
+        int flags = 0;
 	u32 len;
 	control.width = inst->width;
 	control.height = inst->height;
@@ -2023,8 +2024,13 @@ static long venc_alloc_recon_buffers(struct v4l2_subdev *sd, void *arg)
 		WFD_MSG_ERR("Failed to get recon buf size\n");
 		goto err;
 	}
-	flags = ION_HEAP(ION_CP_MM_HEAP_ID);
-	flags |= inst->secure ? ION_SECURE : ION_HEAP(ION_IOMMU_HEAP_ID);
+
+        if (inst->secure) {
+                heap_mask = ION_HEAP(ION_CP_MM_HEAP_ID);
+                flags |=  ION_SECURE;
+        } else {
+                heap_mask = (ION_HEAP(ION_CP_MM_HEAP_ID) | ION_HEAP(ION_IOMMU_HEAP_ID));
+        }
 
 	if (vcd_get_ion_status()) {
 		for (i = 0; i < 4; ++i) {
@@ -2035,7 +2041,7 @@ static long venc_alloc_recon_buffers(struct v4l2_subdev *sd, void *arg)
 			ctrl->user_virtual_addr = (void *)i;
 			client_ctx->recon_buffer_ion_handle[i]
 				= ion_alloc(client_ctx->user_ion_client,
-                                            control.size, SZ_8K, flags, 0);
+			control.size, SZ_8K, heap_mask, flags);
 
 			ctrl->kernel_virtual_addr = ion_map_kernel(
 				client_ctx->user_ion_client,

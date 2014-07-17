@@ -21,12 +21,12 @@
 			{\
 				.src = MSM_BUS_MASTER_AMPSS_M0, \
 				.dst = MSM_BUS_SLAVE_EBI_CH0, \
-				.ib = (_bw) * 1000000ULL, \
+				.ib = (_bw) * 1000000UL, \
 			}, \
 			{ \
 				.src = MSM_BUS_MASTER_AMPSS_M1, \
 				.dst = MSM_BUS_SLAVE_EBI_CH0, \
-				.ib = (_bw) * 1000000ULL, \
+				.ib = (_bw) * 1000000UL, \
 			}, \
 		}, \
 		.num_paths = 2, \
@@ -100,7 +100,11 @@ struct l2_level {
 };
 
 struct acpu_level {
+#ifdef CONFIG_ACPU_CUSTOM_FREQ_SUPPORT
+	unsigned int use_for_scaling;
+#else
 	const int use_for_scaling;
+#endif
 	const struct core_speed speed;
 	const unsigned int l2_level;
 	int vdd_core;

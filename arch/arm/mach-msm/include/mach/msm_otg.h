@@ -51,7 +51,7 @@ struct msm_otg_ops {
 	void		*handle;
 };
 
-#if defined(CONFIG_USB_MSM_OTG) || defined(CONFIG_USB_MSM_OTG_HTC)
+#ifdef CONFIG_USB_MSM_OTG
 
 extern struct msm_otg_transceiver *msm_otg_get_transceiver(void);
 extern void msm_otg_put_transceiver(struct msm_otg_transceiver *xceiv);

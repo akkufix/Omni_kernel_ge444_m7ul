@@ -22,9 +22,8 @@
 #include <mach/usb_bridge.h>
 #include <mach/usb_gadget_xport.h>
 
-/* from cdc-acm.h */
-#define ACM_CTRL_RTS		(1 << 1)	/* unused with full duplex */
-#define ACM_CTRL_DTR		(1 << 0)	/* host is ready for data r/w */
+#define ACM_CTRL_RTS		(1 << 1)	
+#define ACM_CTRL_DTR		(1 << 0)	
 #define ACM_CTRL_OVERRUN	(1 << 6)
 #define ACM_CTRL_PARITY		(1 << 5)
 #define ACM_CTRL_FRAMING	(1 << 4)
@@ -37,8 +36,8 @@
 static unsigned int	no_ctrl_ports;
 
 static const char	*ctrl_bridge_names[] = {
-	"dun_ctrl_hsic0",
-	"rmnet_ctrl_hsic0"
+	"serial_hsic_ctrl",
+	"rmnet_hsic_ctrl"
 };
 
 #define CTRL_BRIDGE_NAME_MAX_LEN	20
@@ -48,33 +47,33 @@ static const char	*ctrl_bridge_names[] = {
 #define CH_READY 1
 
 struct gctrl_port {
-	/* port */
+	
 	unsigned		port_num;
 
-	/* gadget */
+	
 	spinlock_t		port_lock;
 	void			*port_usb;
 
-	/* work queue*/
+	
 	struct workqueue_struct	*wq;
 	struct work_struct	connect_w;
 	struct work_struct	disconnect_w;
 
 	enum gadget_type	gtype;
 
-	/*ctrl pkt response cb*/
+	
 	int (*send_cpkt_response)(void *g, void *buf, size_t len);
 
 	struct bridge		brdg;
 
-	/* bridge status */
+	
 	unsigned long		bridge_sts;
 
-	/* control bits */
+	
 	unsigned		cbits_tomodem;
 	unsigned		cbits_tohost;
 
-	/* counters */
+	
 	unsigned long		to_modem;
 	unsigned long		to_host;
 	unsigned long		drp_cpkt_cnt;
@@ -93,7 +92,7 @@ static int ghsic_ctrl_receive(void *dev, void *buf, size_t actual)
 	pr_debug_ratelimited("%s: read complete bytes read: %d\n",
 			__func__, actual);
 
-	/* send it to USB here */
+	
 	if (port && port->send_cpkt_response) {
 		retval = port->send_cpkt_response(port->port_usb, buf, actual);
 		port->to_host++;
@@ -125,7 +124,7 @@ ghsic_send_cpkt_tomodem(u8 portno, void *buf, size_t len)
 
 	memcpy(cbuf, buf, len);
 
-	/* drop cpkt if ch is not open */
+	
 	if (!test_bit(CH_OPENED, &port->bridge_sts)) {
 		port->drp_cpkt_cnt++;
 		kfree(cbuf);
@@ -268,7 +267,7 @@ static void gctrl_disconnect_w(struct work_struct *w)
 	if (!test_bit(CH_OPENED, &port->bridge_sts))
 		return;
 
-	/* send the dtr zero */
+	
 	ctrl_bridge_close(port->brdg.ch_id);
 	clear_bit(CH_OPENED, &port->bridge_sts);
 }
@@ -336,22 +335,38 @@ static void ghsic_ctrl_status(void *ctxt, unsigned int ctrl_bits)
 		gser->send_modem_ctrl_bits(gser, ctrl_bits);
 }
 
+static int ghsic_ctrl_get_port_id(const char *pdev_name)
+{
+	struct gctrl_port	*port;
+	int			i;
+
+	for (i = 0; i < no_ctrl_ports; i++) {
+		port = gctrl_ports[i].port;
+		if (!strncmp(port->brdg.name, pdev_name, BRIDGE_NAME_MAX_LEN))
+			return i;
+	}
+
+	return -EINVAL;
+}
+
 static int ghsic_ctrl_probe(struct platform_device *pdev)
 {
 	struct gctrl_port	*port;
 	unsigned long		flags;
+	int			id;
 
 	pr_debug("%s: name:%s\n", __func__, pdev->name);
 
-	if (pdev->id >= no_ctrl_ports) {
-		pr_err("%s: invalid port: %d\n", __func__, pdev->id);
+	id = ghsic_ctrl_get_port_id(pdev->name);
+	if (id < 0 || id >= no_ctrl_ports) {
+		pr_err("%s: invalid port: %d\n", __func__, id);
 		return -EINVAL;
 	}
 
-	port = gctrl_ports[pdev->id].port;
+	port = gctrl_ports[id].port;
 	set_bit(CH_READY, &port->bridge_sts);
 
-	/* if usb is online, start read */
+	
 	spin_lock_irqsave(&port->port_lock, flags);
 	if (port->port_usb)
 		queue_work(port->wq, &port->connect_w);
@@ -366,15 +381,17 @@ static int ghsic_ctrl_remove(struct platform_device *pdev)
 	struct gserial		*gser = NULL;
 	struct grmnet		*gr = NULL;
 	unsigned long		flags;
+	int			id;
 
 	pr_debug("%s: name:%s\n", __func__, pdev->name);
 
-	if (pdev->id >= no_ctrl_ports) {
-		pr_err("%s: invalid port: %d\n", __func__, pdev->id);
+	id = ghsic_ctrl_get_port_id(pdev->name);
+	if (id < 0 || id >= no_ctrl_ports) {
+		pr_err("%s: invalid port: %d\n", __func__, id);
 		return -EINVAL;
 	}
 
-	port = gctrl_ports[pdev->id].port;
+	port = gctrl_ports[id].port;
 
 	spin_lock_irqsave(&port->port_lock, flags);
 	if (!port->port_usb) {
@@ -441,7 +458,7 @@ static int gctrl_port_alloc(int portno, enum gadget_type gtype)
 	INIT_WORK(&port->connect_w, ghsic_ctrl_connect_w);
 	INIT_WORK(&port->disconnect_w, gctrl_disconnect_w);
 
-	port->brdg.ch_id = portno;
+	port->brdg.name = (char*)ctrl_bridge_names[portno];;
 	port->brdg.ctx = port;
 	port->brdg.ops.send_pkt = ghsic_ctrl_receive;
 	if (port->gtype == USB_GADGET_SERIAL)
@@ -478,7 +495,7 @@ int ghsic_ctrl_setup(unsigned int num_ports, enum gadget_type gtype)
 
 	for (i = first_port_id; i < (first_port_id + num_ports); i++) {
 
-		/*probe can be called while port_alloc,so update no_ctrl_ports*/
+		
 		no_ctrl_ports++;
 		ret = gctrl_port_alloc(i, gtype);
 		if (ret) {

@@ -25,7 +25,6 @@
 #include <linux/fb.h>
 #include <linux/msm_mdp.h>
 #include <linux/init.h>
-#include <linux/kthread.h>
 #include <linux/ioport.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -44,6 +43,7 @@
 #include <linux/leds.h>
 #include <linux/pm_runtime.h>
 #include <linux/sync.h>
+#include <linux/minifb.h>
 #include <linux/sw_sync.h>
 #include <linux/file.h>
 
@@ -54,24 +54,28 @@
 #include "mdp.h"
 #include "mdp4.h"
 
+#include <mach/debug_display.h>
+
 #ifdef CONFIG_FB_MSM_TRIPLE_BUFFER
 #define MSM_FB_NUM	3
 #endif
 
-#ifdef CONFIG_INPUT_CAPELLA_CM3629
-extern int get_lightsensoradc(void);
-#else
-static inline int get_lightsensoradc(void) { return 0; }
+#ifdef CONFIG_FB_MSM_ESD_WORKAROUND
+#include <linux/suspend.h>
+#include "mipi_dsi.h"
+extern void request_suspend_state(suspend_state_t new_state);
+static struct workqueue_struct *esd_wq = NULL;
+static struct delayed_work esd_dw;
+void esd_wq_routine(struct work_struct *work);
+struct msm_fb_data_type *fb_data = NULL;
+bool video_mode = false;
 #endif
+int get_lightsensoradc(void);
 static unsigned char *fbram;
 static unsigned char *fbram_phys;
 static int fbram_size;
 static boolean bf_supported;
-/* Set backlight on resume after 50 ms after first
- * pan display on the panel. This is to avoid panel specific
- * transients during resume.
- */
-unsigned long backlight_duration = (HZ/20);
+
 static struct platform_device *pdev_list[MSM_FB_MAX_DEV_LIST];
 static int pdev_list_cnt;
 
@@ -96,14 +100,13 @@ static u32 msm_fb_pseudo_palette[16] = {
 static struct ion_client *iclient;
 
 u32 msm_fb_debug_enabled;
-/* Setting msm_fb_msg_level to 8 prints out ALL messages */
 u32 msm_fb_msg_level = 7;
 
-/* Setting mddi_msg_level to 8 prints out ALL messages */
 u32 mddi_msg_level = 5;
 
 extern int32 mdp_block_power_cnt[MDP_MAX_BLOCK];
 extern unsigned long mdp_timer_duration;
+extern boolean mdp_suspended;
 
 static int msm_fb_register(struct msm_fb_data_type *mfd);
 static int msm_fb_open(struct fb_info *info, int user);
@@ -123,18 +126,50 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 static int msm_fb_mmap(struct fb_info *info, struct vm_area_struct * vma);
 static int mdp_bl_scale_config(struct msm_fb_data_type *mfd,
 						struct mdp_bl_scale_data *data);
-static void msm_fb_scale_bl(__u32 *bl_lvl);
-static int msm_fb_commit_thread(void *data);
+static void msm_fb_commit_wq_handler(struct work_struct *work);
 static int msm_fb_pan_idle(struct msm_fb_data_type *mfd);
+static void msm_fb_scale_bl(__u32 *bl_lvl);
+void msm_fb_shutdown(struct platform_device *pdev);
+void msm_fb_display_off(struct msm_fb_data_type *mfd);
+
+#ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
+#define NUM_ALLOC 3
+#define ION_CLIENT_FB_PJT "msmfb_projector"
+static struct ion_client *usb_pjt_client = NULL;
+static struct ion_handle *usb_pjt_handle[NUM_ALLOC] = { NULL };
+static void *virt_addr[NUM_ALLOC] = {0};
+static int mem_fd[NUM_ALLOC] = {0};
+static struct msmfb_usb_projector_info usb_pjt_info = {0, 0};
+struct msmfb_disp_projector_info disp_pjt_info = {0, 0, 0, 0};
+static int mem_mapped = 0;
+
+char *get_fb_addr(void)
+{
+	int i;
+	if (!usb_pjt_info.latest_offset) {
+		printk(KERN_WARNING "%s: wrong address sent via ioctl?\n", __func__);
+		return 0;
+	}
+
+	usb_pjt_info.usb_offset = usb_pjt_info.latest_offset;
+
+	for (i=0; i<NUM_ALLOC; i++)
+		if (mem_fd[i] == usb_pjt_info.usb_offset)
+			return (char *)virt_addr[i];
+
+	printk(KERN_ERR "%s: <FATAL> Impossible to be here.\n", __func__);
+	return 0;
+}
+#endif
+
 
 #ifdef MSM_FB_ENABLE_DBGFS
 
 #define MSM_FB_MAX_DBGFS 1024
 #define MAX_BACKLIGHT_BRIGHTNESS 255
 
-#define WAIT_FENCE_FIRST_TIMEOUT (3 * MSEC_PER_SEC)
-#define WAIT_FENCE_FINAL_TIMEOUT (10 * MSEC_PER_SEC)
-/* Display op timeout should be greater than total timeout */
+#define WAIT_FENCE_FIRST_TIMEOUT MSEC_PER_SEC
+#define WAIT_FENCE_FINAL_TIMEOUT 10 * MSEC_PER_SEC
 #define WAIT_DISP_OP_TIMEOUT (WAIT_FENCE_FIRST_TIMEOUT +\
         WAIT_FENCE_FINAL_TIMEOUT) * MDP_MAX_FENCE_FD
 #define MAX_TIMELINE_NAME_LEN 16
@@ -255,7 +290,7 @@ static int cabc_level_ctl_switch(int level)
 		return 1;
 
 	cabc_level_ctl_status = level;
-	printk(KERN_INFO "%s: change cabc level\n", __func__);
+	PR_DISP_INFO("%s: change cabc level\n", __func__);
 
 	return 0;
 }
@@ -286,7 +321,7 @@ cabc_level_ctl_store(struct device *dev, struct device_attribute *attr,
 
 	rc = strict_strtoul(buf, 10, &res);
 	if (rc) {
-		printk(KERN_INFO "invalid parameter, %s %d\n", buf, rc);
+		PR_DISP_INFO("invalid parameter, %s %d\n", buf, rc);
 		count = -EINVAL;
 		goto err_out;
 	}
@@ -338,7 +373,7 @@ sre_ctl_store(struct device *dev, struct device_attribute *attr,
 
    rc = strict_strtoul(buf, 10, &res);
    if (rc) {
-       printk(KERN_INFO "invalid parameter, %s %d\n", buf, rc);
+       PR_DISP_INFO("invalid parameter, %s %d\n", buf, rc);
        count = -EINVAL;
        goto err_out;
    }
@@ -357,9 +392,6 @@ static void msm_fb_set_bl_brightness(struct led_classdev *led_cdev,
 	struct msm_fb_data_type *mfd = dev_get_drvdata(led_cdev->dev->parent);
 	int bl_lvl;
 
-	/* This maps android backlight level 1 to 255 into
-	   driver backlight level bl_min to bl_max with rounding
-	   and maps backlight level 0 to 0. */
 	if (value <= 0)
 		bl_lvl = 0;
 	else if (value >= MAX_BACKLIGHT_BRIGHTNESS)
@@ -377,7 +409,7 @@ static void msm_fb_set_bl_brightness(struct led_classdev *led_cdev,
 
 static struct led_classdev backlight_led = {
 	.name		= "lcd-backlight",
-	.brightness	= (MAX_BACKLIGHT_BRIGHTNESS * .75),
+	.brightness	= MAX_BACKLIGHT_BRIGHTNESS,
 	.brightness_set	= msm_fb_set_bl_brightness,
 };
 #endif
@@ -458,6 +490,7 @@ static ssize_t app_list_value_show(struct device *dev,
 #define BACKLIGHT_ATTR(name) __ATTR(name, 0644, app_list_value_show, NULL)
 static struct device_attribute app_attr = BACKLIGHT_ATTR(backlight_info);
 
+
 static struct msm_fb_platform_data *msm_fb_pdata;
 unsigned char hdmi_prim_display;
 unsigned char hdmi_prim_resolution;
@@ -505,8 +538,6 @@ int msm_fb_detect_client(const char *name)
 	if (msm_fb_pdata && msm_fb_pdata->detect_client) {
 		ret = msm_fb_pdata->detect_client(name);
 
-		/* if it's non mddi panel, we need to pre-scan
-		   mddi client to see if we can disable mddi host */
 
 #ifdef CONFIG_FB_MSM_MDDI_AUTO_DETECT
 		if (!ret && msm_fb_pdata->mddi_prescan)
@@ -527,9 +558,6 @@ static ssize_t msm_fb_fps_level_change(struct device *dev,
 		(struct msm_fb_panel_data *)mfd->pdev->dev.platform_data;
 	unsigned long val;
 	int ret;
-
-	if (mfd->panel.type != MIPI_VIDEO_PANEL)
-		return -EINVAL;
 
 	ret = kstrtoul(buf, 10, &val);
 	if (ret)
@@ -597,7 +625,7 @@ static ssize_t msm_fb_msm_fb_type(struct device *dev,
 }
 
 static DEVICE_ATTR(msm_fb_type, S_IRUGO, msm_fb_msm_fb_type, NULL);
-static DEVICE_ATTR(msm_fb_fps_level, S_IRUGO | S_IWUSR | S_IWGRP, NULL, \
+static DEVICE_ATTR(msm_fb_fps_level, S_IRUGO | S_IWUSR, NULL, \
 				msm_fb_fps_level_change);
 static struct attribute *msm_fb_attrs[] = {
 	&dev_attr_msm_fb_type.attr,
@@ -619,7 +647,6 @@ static int msm_fb_create_sysfs(struct platform_device *pdev)
 			rc);
 	return rc;
 }
-
 static void msm_fb_remove_sysfs(struct platform_device *pdev)
 {
 	struct msm_fb_data_type *mfd = platform_get_drvdata(pdev);
@@ -660,10 +687,14 @@ static void sre_do_work(struct work_struct *work)
 static void sre_update(unsigned long data)
 {
    struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)data;
+
+   if (!mfd->panel_power_on) {
+	PR_DISP_INFO("%s: skip sre_work\n", __func__);
+	return;
+   }
+
    queue_work(mfd->sre_wq, &mfd->sre_work);
 }
-
-static void bl_workqueue_handler(struct work_struct *work);
 
 static int msm_fb_probe(struct platform_device *pdev)
 {
@@ -711,8 +742,6 @@ static int msm_fb_probe(struct platform_device *pdev)
 
 	mfd = (struct msm_fb_data_type *)platform_get_drvdata(pdev);
 
-	INIT_DELAYED_WORK(&mfd->backlight_worker, bl_workqueue_handler);
-
 	if (!mfd)
 		return -ENODEV;
 
@@ -722,8 +751,14 @@ static int msm_fb_probe(struct platform_device *pdev)
 	if (pdev_list_cnt >= MSM_FB_MAX_DEV_LIST)
 		return -ENOMEM;
 
+	if (mfd->panel_info.pdest == DISPLAY_1) {
+		if (mfd->panel_info.camera_backlight)
+			backlightvalue = mfd->panel_info.camera_backlight;
+	}
+
 	vsync_cntrl.dev = mfd->fbi->dev;
 	mfd->panel_info.frame_count = 0;
+
 	mfd->bl_level = 0;
 	bl_scale = 1024;
 	bl_min_lvl = 255;
@@ -743,26 +778,25 @@ static int msm_fb_probe(struct platform_device *pdev)
 #ifdef CONFIG_FB_BACKLIGHT
 	msm_fb_config_backlight(mfd);
 #else
-	/* android supports only one lcd-backlight/lcd for now */
+	
 	if (!lcd_backlight_registered) {
 		if (led_classdev_register(&pdev->dev, &backlight_led))
 			printk(KERN_ERR "led_classdev_register failed\n");
 		else {
-			msm_fb_set_bl_brightness(&backlight_led, backlight_led.brightness);
 			lcd_backlight_registered = 1;
 			if (device_create_file(backlight_led.dev, &color_enhance_attr))
 				printk("attr creation failed\n");
 #ifdef CONFIG_MSM_ACL_ENABLE
 			if(device_create_file(backlight_led.dev, &auto_attr))
-				printk(KERN_INFO "attr creation failed\n");
+				PR_DISP_INFO("attr creation failed\n");
 #endif
 
 #ifdef CONFIG_FB_MSM_CABC_LEVEL_CONTROL
 			if (device_create_file(backlight_led.dev, &cabc_level_ctl_attr))
-				printk(KERN_INFO "attr creation failed\n");
+				PR_DISP_INFO("attr creation failed\n");
 #endif
 			if (device_create_file(backlight_led.dev, &sre_ctl_attr))
-				printk(KERN_INFO "attr creation failed for sre_ctl_attr\n");
+				PR_DISP_INFO("attr creation failed for sre_ctl_attr\n");
 
 		}
 	}
@@ -807,6 +841,23 @@ static int msm_fb_probe(struct platform_device *pdev)
 		}
 	}
 
+#ifdef CONFIG_FB_MSM_ESD_WORKAROUND
+	if((pdata) && (pdata->esd_workaround) && (mfd->panel_info.pdest == DISPLAY_1)) {
+		if (esd_wq == NULL) {
+			esd_wq = create_workqueue("esd_wq");
+			printk(KERN_DEBUG "msmfb_probe: Create ESD workqueue(0x%x)...\n",
+				(unsigned int)esd_wq);
+		}
+
+		if (esd_wq)
+			INIT_DELAYED_WORK(&esd_dw, esd_wq_routine);
+
+		fb_data = mfd;
+
+		if (pdata->panel_info.type == MIPI_VIDEO_PANEL)
+			video_mode = true;
+	}
+#endif
 
 	return 0;
 }
@@ -819,17 +870,17 @@ static int msm_fb_remove(struct platform_device *pdev)
 
 	mfd = (struct msm_fb_data_type *)platform_get_drvdata(pdev);
 
-	msm_fb_pan_idle(mfd);
-
-	msm_fb_remove_sysfs(pdev);
-
-	pm_runtime_disable(mfd->fbi->dev);
-
 	if (!mfd)
 		return -ENODEV;
 
 	if (mfd->key != MFD_KEY)
 		return -EINVAL;
+
+	msm_fb_pan_idle(mfd);
+
+	msm_fb_remove_sysfs(pdev);
+
+	pm_runtime_disable(mfd->fbi->dev);
 
 	if (msm_fb_suspend_sub(mfd))
 		printk(KERN_ERR "msm_fb_remove: can't stop the device %d\n", mfd->index);
@@ -853,13 +904,12 @@ static int msm_fb_remove(struct platform_device *pdev)
 		del_timer(&mfd->msmfb_no_update_notify_timer);
 	complete(&mfd->msmfb_no_update_notify);
 	complete(&mfd->msmfb_update_notify);
-	kthread_stop(mfd->commit_thread);
 
-	/* remove /dev/fb* */
+	
 	unregister_framebuffer(mfd->fbi);
 
 #ifdef CONFIG_FB_BACKLIGHT
-	/* remove /sys/class/backlight */
+	
 	backlight_device_unregister(mfd->fbi->bl_dev);
 #else
 	if (lcd_backlight_registered) {
@@ -907,6 +957,18 @@ static int msm_fb_suspend(struct platform_device *pdev, pm_message_t state)
 }
 #else
 #define msm_fb_suspend NULL
+void msm_fb_shutdown(struct platform_device *pdev)
+{
+	struct msm_fb_data_type *mfd = platform_get_drvdata(pdev);
+
+	if ((!mfd) || (mfd->key != MFD_KEY))
+		return;
+
+	for (; mfd->ref_cnt > 1; mfd->ref_cnt--)
+		pm_runtime_put(mfd->fbi->dev);
+
+	msm_fb_release(mfd->fbi, 0);
+}
 #endif
 
 static int msm_fb_suspend_sub(struct msm_fb_data_type *mfd)
@@ -916,17 +978,9 @@ static int msm_fb_suspend_sub(struct msm_fb_data_type *mfd)
 	if ((!mfd) || (mfd->key != MFD_KEY))
 		return 0;
 
-	/*
-	 * suspend this channel
-	 */
 	mfd->suspend.sw_refreshing_enable = mfd->sw_refreshing_enable;
 	mfd->suspend.op_enable = mfd->op_enable;
 
-	/*
-	 * For HDMI/DTV, panel needs not to be turned ON during resume
-	 * as power_ctrl will turn ON the HPD at resume which will turn
-	 * ON the panel in case the HDMI cable is still connected.
-	 */
 	if (mfd->panel_info.type == HDMI_PANEL ||
 	    mfd->panel_info.type == DTV_PANEL)
 		mfd->suspend.panel_power_on = false;
@@ -946,15 +1000,8 @@ static int msm_fb_suspend_sub(struct msm_fb_data_type *mfd)
 		}
 		mfd->op_enable = FALSE;
 	}
-	/*
-	 * try to power down
-	 */
 	mdp_pipe_ctrl(MDP_MASTER_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 
-	/*
-	 * detach display channel irq if there's any
-	 * or wait until vsync-resync completes
-	 */
 	if ((mfd->dest == DISPLAY_LCD)) {
 		if (mfd->panel_info.lcd.vsync_enable) {
 			if (mfd->panel_info.lcd.hw_vsync_mode) {
@@ -983,11 +1030,11 @@ static int msm_fb_resume_sub(struct msm_fb_data_type *mfd)
 
 	pdata = (struct msm_fb_panel_data *)mfd->pdev->dev.platform_data;
 
-	/* attach display channel irq if there's any */
+	
 	if (mfd->channel_irq != 0)
 		enable_irq(mfd->channel_irq);
 
-	/* resume state var recover */
+	
 	mfd->sw_refreshing_enable = mfd->suspend.sw_refreshing_enable;
 	mfd->op_enable = mfd->suspend.op_enable;
 
@@ -1011,8 +1058,6 @@ static int msm_fb_resume_sub(struct msm_fb_data_type *mfd)
 #if defined(CONFIG_PM) && !defined(CONFIG_HAS_EARLYSUSPEND)
 static int msm_fb_resume(struct platform_device *pdev)
 {
-	/* This resume function is called when interrupt is enabled.
-	 */
 	int ret = 0;
 	struct msm_fb_data_type *mfd;
 
@@ -1077,7 +1122,7 @@ static int msm_fb_ext_suspend(struct device *dev)
 		mfd->panel_info.type == DTV_PANEL) {
 		ret = msm_fb_suspend_sub(mfd);
 
-		/* Turn off the HPD circuitry */
+		
 		if (pdata->power_ctrl) {
 			MSM_FB_INFO("%s: Turning off HPD circuitry\n",
 					__func__);
@@ -1106,7 +1151,7 @@ static int msm_fb_ext_resume(struct device *dev)
 	pdata = (struct msm_fb_panel_data *)mfd->pdev->dev.platform_data;
 	if (mfd->panel_info.type == HDMI_PANEL ||
 		mfd->panel_info.type == DTV_PANEL) {
-		/* Turn on the HPD circuitry */
+		
 		if (pdata->power_ctrl) {
 			pdata->power_ctrl(TRUE);
 			MSM_FB_INFO("%s: Turning on HPD circuitry\n",
@@ -1138,9 +1183,9 @@ static struct platform_driver msm_fb_driver = {
 	.suspend = msm_fb_suspend,
 	.resume = msm_fb_resume,
 #endif
-	.shutdown = NULL,
+	.shutdown = msm_fb_shutdown,
 	.driver = {
-		   /* Driver name must match the device name added in platform.c. */
+		   
 		   .name = "msm_fb",
 		   .pm = &msm_fb_dev_pm_ops,
 		   },
@@ -1160,14 +1205,11 @@ static void msmfb_early_suspend(struct early_suspend *h)
 {
 	struct msm_fb_data_type *mfd = container_of(h, struct msm_fb_data_type,
 						early_suspend);
-	struct msm_fb_panel_data *pdata = NULL;
+	struct msm_fb_panel_data *pdata = (struct msm_fb_panel_data *)mfd->pdev->
+						dev.platform_data;
 
 	msm_fb_pan_idle(mfd);
 #if defined(CONFIG_FB_MSM_MDP303)
-	/*
-	* For MDP with overlay, set framebuffer with black pixels
-	* to show black screen on HDMI.
-	*/
 	struct fb_info *fbi = mfd->fbi;
 	switch (mfd->fbi->var.bits_per_pixel) {
 	case 32:
@@ -1182,13 +1224,18 @@ static void msmfb_early_suspend(struct early_suspend *h)
 		break;
 	}
 #endif
+
+#ifdef CONFIG_FB_MSM_ESD_WORKAROUND
+	if(pdata && pdata->esd_workaround)
+		cancel_delayed_work_sync(&esd_dw);
+#endif
+
 	msm_fb_suspend_sub(mfd);
 
-	pdata = (struct msm_fb_panel_data *)mfd->pdev->dev.platform_data;
 	if (hdmi_prim_display &&
 		(mfd->panel_info.type == HDMI_PANEL ||
 		 mfd->panel_info.type == DTV_PANEL)) {
-		/* Turn off the HPD circuitry */
+		
 		if (pdata->power_ctrl) {
 			MSM_FB_INFO("%s: Turning off HPD circuitry\n",
 				__func__);
@@ -1208,7 +1255,7 @@ static void msmfb_early_resume(struct early_suspend *h)
 	if (hdmi_prim_display &&
 		(mfd->panel_info.type == HDMI_PANEL ||
 		 mfd->panel_info.type == DTV_PANEL)) {
-		/* Turn on the HPD circuitry */
+		
 		if (pdata->power_ctrl) {
 			MSM_FB_INFO("%s: Turning on HPD circuitry\n", __func__);
 			pdata->power_ctrl(TRUE);
@@ -1216,11 +1263,95 @@ static void msmfb_early_resume(struct early_suspend *h)
 	}
 
 	msm_fb_resume_sub(mfd);
+
+#ifdef CONFIG_FB_MSM_ESD_WORKAROUND
+	if(mfd->key == MFD_KEY && pdata && pdata->esd_workaround)
+		queue_delayed_work(esd_wq, &esd_dw, msecs_to_jiffies(5000));
+#endif
 }
+#ifdef CONFIG_HTC_ONMODE_CHARGING
+static void msmfb_onchg_suspend(struct early_suspend *h)
+{
+	struct msm_fb_data_type *mfd = container_of(h, struct msm_fb_data_type,
+						    onchg_suspend);
+	msm_fb_pan_idle(mfd);
+#ifdef CONFIG_FB_MSM_MDP303
+	struct fb_info *fbi = mfd->fbi;
+	switch (mfd->fbi->var.bits_per_pixel) {
+	case 32:
+		memset32_io((void *)fbi->screen_base, 0xFF000000,
+							fbi->fix.smem_len);
+		break;
+	default:
+		memset_io(fbi->screen_base, 0x00, fbi->fix.smem_len);
+		break;
+	}
+#endif
+	MSM_FB_INFO("%s starts.\n", __func__);
+
+	msm_fb_suspend_sub(mfd);
+	mdp_suspended = true;
+	MSM_FB_INFO("%s is done.\n", __func__);
+}
+static void msmfb_onchg_resume(struct early_suspend *h)
+{
+	struct msm_fb_data_type *mfd = container_of(h, struct msm_fb_data_type,
+						    onchg_suspend);
+
+	MSM_FB_INFO("%s starts.\n", __func__);
+	msm_fb_pan_idle(mfd);
+	msm_fb_resume_sub(mfd);
+
+	if (mfd->panel_info.pdest == DISPLAY_1) {
+		struct fb_info *info = mfd->fbi;
+		msm_fb_blank_sub(FB_BLANK_UNBLANK, info,
+			mfd->op_enable);
+	}
+
+	mdp_suspended = false;
+	MSM_FB_INFO("%s is done.\n", __func__);
+}
+#endif 
 #endif
 
 static int unset_bl_level, bl_updated;
 static int bl_level_old;
+
+#ifdef CONFIG_FB_MSM_ESD_WORKAROUND
+void esd_wq_routine(struct work_struct *work) {
+	struct msm_fb_panel_data *pdata = (struct msm_fb_panel_data *)fb_data->pdev->dev.platform_data;
+	uint32 err_status = mipi_dsi_cmd_bta_sw_trigger_status(); 
+	uint32 mode;
+
+	if (video_mode) {
+		mipi_set_tx_power_mode(0);
+		mode = mipi_dsi_read_power_mode();
+		mipi_set_tx_power_mode(1);
+	} else {
+		mode = mipi_dsi_read_power_mode();
+	}
+
+	MIPI_OUTP(MIPI_DSI_BASE + 0x0064, err_status);
+	err_status &= ~0x10000000;
+	MSM_FB_INFO("[DISP] err_status=%x\n", err_status);
+
+	if ((err_status)||(mode != 0x9c)) {
+		MSM_FB_INFO("[DISP] Panel recovery for ESD workaround!\n");
+		mutex_lock(&msm_fb_blank_mutex);
+		msm_fb_display_off(fb_data);
+		pdata->off(fb_data->pdev);
+		hr_msleep(10);
+		pdata->on(fb_data->pdev);
+		msm_fb_pan_display(&fb_data->fbi->var, fb_data->fbi);
+		mutex_unlock(&msm_fb_blank_mutex);
+		fb_data->bl_level = DEFAULT_BRIGHTNESS;
+		pdata->set_backlight(fb_data);
+		queue_delayed_work(esd_wq, &esd_dw, msecs_to_jiffies(5000));
+	} else {
+		queue_delayed_work(esd_wq, &esd_dw, msecs_to_jiffies(5000));
+	}
+}
+#endif
 
 static int mdp_bl_scale_config(struct msm_fb_data_type *mfd,
 						struct mdp_bl_scale_data *data)
@@ -1234,9 +1365,8 @@ static int mdp_bl_scale_config(struct msm_fb_data_type *mfd,
 	pr_debug("%s: update scale = %d, min_lvl = %d\n", __func__, bl_scale,
 								bl_min_lvl);
 
-	/* update current backlight to use new scaling*/
-	if (mfd->panel_power_on && bl_updated)
-		msm_fb_set_backlight(mfd, curr_bl);
+	
+	msm_fb_set_backlight(mfd, curr_bl);
 	up(&mfd->sem);
 
 	return ret;
@@ -1247,10 +1377,10 @@ static void msm_fb_scale_bl(__u32 *bl_lvl)
 	__u32 temp = *bl_lvl;
 	pr_debug("%s: input = %d, scale = %d", __func__, temp, bl_scale);
 	if (temp >= bl_min_lvl) {
-		/* bl_scale is the numerator of scaling fraction (x/1024)*/
+		
 		temp = ((*bl_lvl) * bl_scale) / 1024;
 
-		/*if less than minimum level, use min level*/
+		
 		if (temp < bl_min_lvl)
 			temp = bl_min_lvl;
 	}
@@ -1259,13 +1389,17 @@ static void msm_fb_scale_bl(__u32 *bl_lvl)
 	(*bl_lvl) = temp;
 }
 
-/*must call this function from within mfd->sem*/
 void msm_fb_set_backlight(struct msm_fb_data_type *mfd, __u32 bkl_lvl)
 {
 	struct msm_fb_panel_data *pdata;
 	__u32 temp = bkl_lvl;
 
-	if (!mfd->panel_power_on || !bl_updated) {
+	if (mfd->panel_power_on && !bl_updated && !mfd->request_display_on) {
+		PR_DISP_INFO("%s: bl_level_old = %d bkl_lvl = %d\n", __func__, bl_level_old, bkl_lvl);
+		unset_bl_level = 0;
+		bl_updated = 1;
+		bl_level_old = 0;	
+	} else if (!mfd->panel_power_on || !bl_updated) {
 		unset_bl_level = bkl_lvl;
 		return;
 	} else {
@@ -1286,6 +1420,36 @@ void msm_fb_set_backlight(struct msm_fb_data_type *mfd, __u32 bkl_lvl)
 	}
 }
 
+void msm_fb_display_on(struct msm_fb_data_type *mfd)
+{
+	struct msm_fb_panel_data *pdata;
+	pdata = (struct msm_fb_panel_data *)mfd->pdev->dev.platform_data;
+
+	if ((pdata) && (pdata->display_on)) {
+		down(&mfd->sem);
+		pdata->display_on(mfd);
+		up(&mfd->sem);
+	}
+	if ((pdata) && (pdata->sre_ctrl)) {
+		mod_timer(&mfd->sre_update_timer, jiffies + msecs_to_jiffies(50));
+	}
+	if ((pdata) && (pdata->dimming_on)) {
+		mod_timer(&mfd->dimming_update_timer, jiffies + msecs_to_jiffies(1000));
+	}
+}
+
+void msm_fb_display_off(struct msm_fb_data_type *mfd)
+{
+        struct msm_fb_panel_data *pdata;
+        pdata = (struct msm_fb_panel_data *)mfd->pdev->dev.platform_data;
+
+        if ((pdata) && (pdata->display_off)) {
+                down(&mfd->sem);
+                pdata->display_off(mfd);
+                up(&mfd->sem);
+        }
+}
+
 static int msm_fb_blank_sub(int blank_mode, struct fb_info *info,
 			    boolean op_enable)
 {
@@ -1304,10 +1468,13 @@ static int msm_fb_blank_sub(int blank_mode, struct fb_info *info,
 		if (!mfd->panel_power_on) {
 			ret = pdata->on(mfd->pdev);
 			if (ret == 0) {
-				down(&mfd->sem);
 				mfd->panel_power_on = TRUE;
-				up(&mfd->sem);
+				mfd->request_display_on = TRUE;
 				mfd->panel_driver_on = mfd->op_enable;
+#ifdef CONFIG_FB_MSM_ESD_WORKAROUND
+				if(pdata && pdata->esd_workaround)
+					queue_delayed_work(esd_wq, &esd_dw, msecs_to_jiffies(10000));
+#endif
 			}
 		}
 		break;
@@ -1320,30 +1487,29 @@ static int msm_fb_blank_sub(int blank_mode, struct fb_info *info,
 		if (mfd->panel_power_on) {
 			int curr_pwr_state;
 
+			
+			if ((pdata) && (pdata->dimming_on))
+				del_timer_sync(&mfd->dimming_update_timer);
+
+			if ((pdata) && (pdata->sre_ctrl)) {
+				del_timer_sync(&mfd->sre_update_timer);
+			}
 			mfd->op_enable = FALSE;
 			curr_pwr_state = mfd->panel_power_on;
-			down(&mfd->sem);
 			mfd->panel_power_on = FALSE;
-			if (mfd->fbi->node == 0)
-				bl_updated = 0;
-			up(&mfd->sem);
-			cancel_delayed_work_sync(&mfd->backlight_worker);
-                        
-                        if ((pdata) && (pdata->dimming_on))
-                          del_timer_sync(&mfd->dimming_update_timer);
-                        
-			if ((pdata) && (pdata->sre_ctrl))
-                          del_timer_sync(&mfd->sre_update_timer);
-                        
-                        if (mfd->msmfb_no_update_notify_timer.function)
+
+			if (mfd->msmfb_no_update_notify_timer.function)
 				del_timer(&mfd->msmfb_no_update_notify_timer);
 			complete(&mfd->msmfb_no_update_notify);
 
-			/* clean fb to prevent displaying old fb */
+			bl_updated = 0;
+
+			
 			if (info->screen_base)
 				memset((void *)info->screen_base, 0,
 				       info->fix.smem_len);
 
+			msm_fb_display_off(mfd);
 			ret = pdata->off(mfd->pdev);
 			if (ret)
 				mfd->panel_power_on = curr_pwr_state;
@@ -1375,8 +1541,6 @@ int calc_fb_offset(struct msm_fb_data_type *mfd, struct fb_info *fbi, int bpp)
 
 	if (fbi->var.yoffset < yres) {
 		offset = (fbi->var.xoffset * bpp);
-				/* iBuf->buf +=	fbi->var.xoffset * bpp + 0 *
-				yres * fbi->fix.line_length; */
 	} else if (fbi->var.yoffset >= yres && fbi->var.yoffset < 2 * yres) {
 		offset = (fbi->var.xoffset * bpp + yres *
 		fbi->fix.line_length + PAGE_SIZE - remainder);
@@ -1462,8 +1626,6 @@ static int msm_fb_blank(int blank_mode, struct fb_info *info)
 	if (mfd->op_enable == 0) {
 		if (blank_mode == FB_BLANK_UNBLANK) {
 			mfd->suspend.panel_power_on = TRUE;
-			/* if unblank is called when system is in suspend,
-			wait for the system to resume */
 			while (mfd->suspend.op_suspend) {
 				pr_debug("waiting for system to resume\n");
 				msleep(20);
@@ -1486,14 +1648,9 @@ static int msm_fb_set_lut(struct fb_cmap *cmap, struct fb_info *info)
 	return 0;
 }
 
-/*
- * Custom Framebuffer mmap() function for MSM driver.
- * Differs from standard mmap() function by allowing for customized
- * page-protection.
- */
 static int msm_fb_mmap(struct fb_info *info, struct vm_area_struct * vma)
 {
-	/* Get frame buffer memory range. */
+	
 	unsigned long start = info->fix.smem_start;
 	u32 len = PAGE_ALIGN((start & ~PAGE_MASK) + info->fix.smem_len);
 	unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
@@ -1503,22 +1660,23 @@ static int msm_fb_mmap(struct fb_info *info, struct vm_area_struct * vma)
 		return -EINVAL;
 
 	if ((vma->vm_end <= vma->vm_start) ||
-	    (off >= len) ||
-	    ((vma->vm_end - vma->vm_start) > (len - off)))
-		return -EINVAL;
+		(off >= len) ||
+		((vma->vm_end - vma->vm_start) > (len - off)))
+                return -EINVAL;
 
 	msm_fb_pan_idle(mfd);
-	/* Set VM flags. */
+
+	
 	start &= PAGE_MASK;
 	off += start;
 	if (off < start)
 		return -EINVAL;
 
 	vma->vm_pgoff = off >> PAGE_SHIFT;
-	/* This is an IO map - tell maydump to skip this VMA */
+	
 	vma->vm_flags |= VM_IO | VM_RESERVED;
 
-	/* Set VM page protection */
+	
 	if (mfd->mdp_fb_page_protection == MDP_FB_PAGE_PROTECTION_WRITECOMBINE)
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	else if (mfd->mdp_fb_page_protection ==
@@ -1533,7 +1691,7 @@ static int msm_fb_mmap(struct fb_info *info, struct vm_area_struct * vma)
 	else
 		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
-	/* Remap the frame buffer I/O range */
+	
 	if (io_remap_pfn_range(vma, vma->vm_start, off >> PAGE_SHIFT,
 				vma->vm_end - vma->vm_start,
 				vma->vm_page_prot))
@@ -1549,26 +1707,22 @@ static struct fb_ops msm_fb_ops = {
 	.fb_read = NULL,
 	.fb_write = NULL,
 	.fb_cursor = NULL,
-	.fb_check_var = msm_fb_check_var,	/* vinfo check */
-	.fb_set_par = msm_fb_set_par,	/* set the video mode according to info->var */
-	.fb_setcolreg = NULL,	/* set color register */
-	.fb_blank = msm_fb_blank,	/* blank display */
-	.fb_pan_display = msm_fb_pan_display,	/* pan display */
-	.fb_fillrect = msm_fb_fillrect,	/* Draws a rectangle */
-	.fb_copyarea = msm_fb_copyarea,	/* Copy data from area to another */
-	.fb_imageblit = msm_fb_imageblit,	/* Draws a image to the display */
+	.fb_check_var = msm_fb_check_var,	
+	.fb_set_par = msm_fb_set_par,	
+	.fb_setcolreg = NULL,	
+	.fb_blank = msm_fb_blank,	
+	.fb_pan_display = msm_fb_pan_display,	
+	.fb_fillrect = msm_fb_fillrect,	
+	.fb_copyarea = msm_fb_copyarea,	
+	.fb_imageblit = msm_fb_imageblit,	
 	.fb_rotate = NULL,
-	.fb_sync = NULL,	/* wait for blit idle, optional */
-	.fb_ioctl = msm_fb_ioctl,	/* perform fb specific ioctl (optional) */
+	.fb_sync = NULL,	
+	.fb_ioctl = msm_fb_ioctl,	
 	.fb_mmap = msm_fb_mmap,
 };
 
 static __u32 msm_fb_line_length(__u32 fb_index, __u32 xres, int bpp)
 {
-	/* The adreno GPU hardware requires that the pitch be aligned to
-	   32 pixels for color buffers, so for the cases where the GPU
-	   is writing directly to fb0, the framebuffer pitch
-	   also needs to be 32 pixel aligned */
 
 	if (fb_index == 0)
 		return ALIGN(xres, 32) * bpp;
@@ -1588,29 +1742,28 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 	int fbram_offset;
 	int remainder, remainder_mode2;
 
-	/*
-	 * fb info initialization
-	 */
 	fix = &fbi->fix;
 	var = &fbi->var;
 
-	fix->type_aux = 0;	/* if type == FB_TYPE_INTERLEAVED_PLANES */
-	fix->visual = FB_VISUAL_TRUECOLOR;	/* True Color */
-	fix->ywrapstep = 0;	/* No support */
-	fix->mmio_start = 0;	/* No MMIO Address */
-	fix->mmio_len = 0;	/* No MMIO Address */
-	fix->accel = FB_ACCEL_NONE;/* FB_ACCEL_MSM needes to be added in fb.h */
+	fix->type_aux = 0;	
+	fix->visual = FB_VISUAL_TRUECOLOR;	
+	fix->ywrapstep = 0;	
+	fix->mmio_start = 0;	
+	fix->mmio_len = 0;	
+	fix->accel = FB_ACCEL_NONE;
 
-	var->xoffset = 0,	/* Offset from virtual to visible */
-	var->yoffset = 0,	/* resolution */
-	var->grayscale = 0,	/* No graylevels */
-	var->nonstd = 0,	/* standard pixel format */
-	var->activate = FB_ACTIVATE_VBL,	/* activate it at vsync */
-	var->height = -1,	/* height of picture in mm */
-	var->width = -1,	/* width of picture in mm */
-	var->accel_flags = 0,	/* acceleration flags */
-	var->sync = 0,	/* see FB_SYNC_* */
-	var->rotate = 0,	/* angle we rotate counter clockwise */
+	var->xoffset = 0,	
+	var->yoffset = 0,	
+	var->grayscale = 0,	
+	var->nonstd = 0,	
+	var->activate = FB_ACTIVATE_VBL,	
+	
+	var->width = mfd->panel_info.width,        
+	var->height = mfd->panel_info.height,      
+	
+	var->accel_flags = 0,	
+	var->sync = 0,	
+	var->rotate = 0,	
 	mfd->op_enable = FALSE;
 
 	switch (mfd->fb_imgType) {
@@ -1691,14 +1844,14 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 		break;
 
 	case MDP_YCRYCB_H2V1:
-		/* ToDo: need to check TV-Out YUV422i framebuffer format */
-		/*       we might need to create new type define */
+		
+		
 		fix->type = FB_TYPE_INTERLEAVED_PLANES;
 		fix->xpanstep = 2;
 		fix->ypanstep = 1;
 		var->vmode = FB_VMODE_NONINTERLACED;
 
-		/* how about R/G/B offset? */
+		
 		var->blue.offset = 0;
 		var->green.offset = 5;
 		var->red.offset = 11;
@@ -1724,11 +1877,9 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 	fix->line_length = msm_fb_line_length(mfd->index, panel_info->xres,
 					      bpp);
 
-	/* Make sure all buffers can be addressed on a page boundary by an x
-	 * and y offset */
 
 	remainder = (fix->line_length * panel_info->yres) & (PAGE_SIZE - 1);
-					/* PAGE_SIZE is a power of 2 */
+					
 	if (!remainder)
 		remainder = PAGE_SIZE;
 	remainder_mode2 = (fix->line_length *
@@ -1736,10 +1887,6 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 	if (!remainder_mode2)
 		remainder_mode2 = PAGE_SIZE;
 
-	/*
-	 * calculate smem_len based on max size of two supplied modes.
-	 * Only fb0 has mem. fb1 and fb2 don't have mem.
-	 */
 	if (!bf_supported || mfd->index == 0)
 		fix->smem_len = MAX((msm_fb_line_length(mfd->index,
 							panel_info->xres,
@@ -1766,15 +1913,12 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 
 	var->xres = panel_info->xres;
 	var->yres = panel_info->yres;
-	var->xres_virtual = panel_info->xres;
+	var->xres_virtual = ALIGN(panel_info->xres, 32);	
 	var->yres_virtual = panel_info->yres * mfd->fb_page +
 		((PAGE_SIZE - remainder)/fix->line_length) * mfd->fb_page;
-	var->bits_per_pixel = bpp * 8;	/* FrameBuffer color depth */
+	var->bits_per_pixel = bpp * 8;	
 	var->reserved[3] = mdp_get_panel_framerate(mfd);
 
-		/*
-		 * id field for fb app
-		 */
 	id = (int *)&mfd->panel;
 
 	switch (mdp_rev) {
@@ -1835,10 +1979,7 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 	init_completion(&mfd->msmfb_no_update_notify);
 	init_completion(&mfd->commit_comp);
 	mutex_init(&mfd->sync_mutex);
-	mutex_init(&mfd->queue_mutex);
-	init_waitqueue_head(&mfd->commit_queue);
-	mfd->commit_thread = kthread_run(msm_fb_commit_thread, mfd,
-			"msmfb_commit_thread");
+	INIT_WORK(&mfd->commit_work, msm_fb_commit_wq_handler);
 	mfd->msm_fb_backup = kzalloc(sizeof(struct msm_fb_backup_type),
 		GFP_KERNEL);
 	if (mfd->msm_fb_backup == 0) {
@@ -1895,7 +2036,7 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 	mfd->op_enable = TRUE;
 	mfd->panel_power_on = FALSE;
 
-	/* cursor memory allocation */
+	
 	if (mfd->cursor_update) {
 		unsigned long cursor_buf_iommu = 0;
 		mfd->cursor_buf = dma_alloc_coherent(NULL,
@@ -1949,7 +2090,7 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 	     mfd->index, fbi->var.xres, fbi->var.yres, fbi->fix.smem_len);
 
 #ifdef CONFIG_FB_MSM_LOGO
-	/* Flip buffer */
+	
 	if (!load_565rle_image(INIT_IMAGE_FILE, bf_supported))
 		;
 #endif
@@ -1963,6 +2104,12 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 		mfd->early_suspend.resume = msmfb_early_resume;
 		mfd->early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB - 2;
 		register_early_suspend(&mfd->early_suspend);
+#ifdef CONFIG_HTC_ONMODE_CHARGING
+		mfd->onchg_suspend.suspend = msmfb_onchg_suspend;
+		mfd->onchg_suspend.resume = msmfb_onchg_resume;
+		mfd->onchg_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB - 2;
+		register_onchg_suspend(&mfd->onchg_suspend);
+#endif
 	}
 #endif
 
@@ -2091,7 +2238,11 @@ static int msm_fb_register(struct msm_fb_data_type *mfd)
 			}
 		}
 	}
-#endif /* MSM_FB_ENABLE_DBGFS */
+#endif 
+
+#ifdef CONFIG_FB_MSM_UNDERFLOW_WORKAROUND
+	mfd->panel_info.lcdc.underflow_clr = 0x0; 
+#endif
 
 	return ret;
 }
@@ -2108,15 +2259,15 @@ static int msm_fb_open(struct fb_info *info, int user)
 		printk(KERN_ERR "pm_runtime: fail to wake up\n");
 	}
 
-	if (info->node == 0 && !(mfd->cont_splash_done)) {	/* primary */
+	if (info->node == 0 && !(mfd->cont_splash_done)) {	
 			mfd->ref_cnt++;
 			return 0;
 	}
 
 	if (mfd->op_enable == 0) {
-		if (!mfd->ref_cnt && info->node == 2)
+		if (info->node == 2)
 			return -EPERM;
-		/* if system is in suspend mode, do not unblank */
+		
 		mfd->ref_cnt++;
 		return 0;
 	}
@@ -2152,7 +2303,7 @@ static void msm_fb_free_base_pipe(struct msm_fb_data_type *mfd)
 static int msm_fb_release(struct fb_info *info, int user)
 {
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
-	int ret = 0, bl_level = 0;
+	int ret = 0;
 
 	if (!mfd->ref_cnt) {
 		MSM_FB_INFO("msm_fb_release: try to close unopened fb %d!\n",
@@ -2164,13 +2315,6 @@ static int msm_fb_release(struct fb_info *info, int user)
 
 	if (!mfd->ref_cnt) {
 		if (mfd->op_enable) {
-			if (info->node == 0) {
-				down(&mfd->sem);
-				bl_level = mfd->bl_level;
-				msm_fb_set_backlight(mfd, 0);
-				unset_bl_level = bl_level;
-				up(&mfd->sem);
-			}
 			ret = msm_fb_blank_sub(FB_BLANK_POWERDOWN, info,
 							mfd->op_enable);
 			if (ret != 0) {
@@ -2189,7 +2333,7 @@ static int msm_fb_release(struct fb_info *info, int user)
 void msm_fb_wait_for_fence(struct msm_fb_data_type *mfd)
 {
 	int i, ret = 0;
-	/* buf sync */
+	
 	for (i = 0; i < mfd->acq_fen_cnt; i++) {
 		ret = sync_fence_wait(mfd->acq_fen[i],
 				WAIT_FENCE_FIRST_TIMEOUT);
@@ -2225,26 +2369,19 @@ int msm_fb_signal_timeline(struct msm_fb_data_type *mfd)
 	}
 	mfd->last_rel_fence = mfd->cur_rel_fence;
 	mfd->cur_rel_fence = 0;
-	if (atomic_read(&mfd->commit_cnt) > 0)
-		atomic_dec(&mfd->commit_cnt);
 	mutex_unlock(&mfd->sync_mutex);
 	return 0;
 }
 
 void msm_fb_release_timeline(struct msm_fb_data_type *mfd)
 {
-	u32 commit_cnt;
 	mutex_lock(&mfd->sync_mutex);
-	commit_cnt = atomic_read(&mfd->commit_cnt) + 2;
-	if (commit_cnt < 0)
-		commit_cnt = 0;
 	if (mfd->timeline) {
-		sw_sync_timeline_inc(mfd->timeline, 2 + commit_cnt);
-		mfd->timeline_value += 2 + commit_cnt;
+		sw_sync_timeline_inc(mfd->timeline, 2);
+		mfd->timeline_value += 2;
 	}
 	mfd->last_rel_fence = 0;
 	mfd->cur_rel_fence = 0;
-	atomic_set(&mfd->commit_cnt, 0);
 	mutex_unlock(&mfd->sync_mutex);
 }
 
@@ -2286,19 +2423,16 @@ static int msm_fb_pan_display_ex(struct fb_info *info,
 
 	if (disp_commit->flags &
 		MDP_DISPLAY_COMMIT_OVERLAY) {
-		if (!mfd->panel_power_on) /* suspended */
+		if (!mfd->panel_power_on) 
 			return -EPERM;
 	} else {
-		/*
-		 * If framebuffer is 2, io pan display is not allowed.
-		 */
 		if (bf_supported && info->node == 2) {
 			pr_err("%s: no pan display for fb%d!",
 				   __func__, info->node);
 			return -EPERM;
 		}
 
-		if (info->node != 0 || mfd->cont_splash_done)	/* primary */
+		if (info->node != 0 || mfd->cont_splash_done)	
 			if ((!mfd->op_enable) || (!mfd->panel_power_on))
 				return -EPERM;
 
@@ -2323,8 +2457,6 @@ static int msm_fb_pan_display_ex(struct fb_info *info,
 			info->var.yoffset =
 				(var->yoffset / info->fix.ypanstep) *
 					info->fix.ypanstep;
-	} else {
-		mdp4_overlay_mdp_perf_upd(mfd, 1);
 	}
 	fb_backup = (struct msm_fb_backup_type *)mfd->msm_fb_backup;
 	memcpy(&fb_backup->info, info, sizeof(struct fb_info));
@@ -2332,30 +2464,11 @@ static int msm_fb_pan_display_ex(struct fb_info *info,
 		sizeof(struct mdp_display_commit));
 	mfd->is_committing = 1;
 	INIT_COMPLETION(mfd->commit_comp);
-	atomic_inc(&mfd->commit_cnt);
-	mfd->wake_commit_thread = 1;
-	wake_up_interruptible_all(&mfd->commit_queue);
+	schedule_work(&mfd->commit_work);
 	mutex_unlock(&mfd->sync_mutex);
 	if (wait_for_finish)
 		msm_fb_pan_idle(mfd);
 	return ret;
-}
-
-static void bl_workqueue_handler(struct work_struct *work)
-{
-	struct msm_fb_data_type *mfd = container_of(to_delayed_work(work),
-				struct msm_fb_data_type, backlight_worker);
-	struct msm_fb_panel_data *pdata = mfd->pdev->dev.platform_data;
-
-	down(&mfd->sem);
-	if ((pdata) && (pdata->set_backlight) && (!bl_updated)
-					&& (mfd->panel_power_on)) {
-		mfd->bl_level = unset_bl_level;
-		pdata->set_backlight(mfd);
-		bl_level_old = unset_bl_level;
-		bl_updated = 1;
-	}
-	up(&mfd->sem);
 }
 
 static int msm_fb_pan_display(struct fb_var_screeninfo *var,
@@ -2376,16 +2489,13 @@ static int msm_fb_pan_display_sub(struct fb_var_screeninfo *var,
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
 	struct msm_fb_panel_data *pdata;
 
-	/*
-	 * If framebuffer is 2, io pen display is not allowed.
-	 */
 	if (bf_supported && info->node == 2) {
 		pr_err("%s: no pan display for fb%d!",
 		       __func__, info->node);
 		return -EPERM;
 	}
 
-	if (info->node != 0 || mfd->cont_splash_done)	/* primary */
+	if (info->node != 0 || mfd->cont_splash_done)	
 		if ((!mfd->op_enable) || (!mfd->panel_power_on))
 			return -EPERM;
 
@@ -2403,7 +2513,7 @@ static int msm_fb_pan_display_sub(struct fb_var_screeninfo *var,
 		info->var.yoffset =
 		    (var->yoffset / info->fix.ypanstep) * info->fix.ypanstep;
 
-	/* "UPDT" */
+	
 	if (var->reserved[0] == 0x54445055) {
 
 		dirty.xoffset = var->reserved[1] & 0xffff;
@@ -2437,6 +2547,7 @@ static int msm_fb_pan_display_sub(struct fb_var_screeninfo *var,
 		dirtyPtr = &dirty;
 	}
 
+	
 	if (test_bit(COLOR_ENHANCE_STATE, &color_enhance_status) != test_bit(COLOR_ENHANCE_STATE, &color_enhance_status_old)) {
 		pdata = (struct msm_fb_panel_data *)mfd->pdev->
 				dev.platform_data;
@@ -2449,6 +2560,7 @@ static int msm_fb_pan_display_sub(struct fb_var_screeninfo *var,
 		}
 		color_enhance_status_old = color_enhance_status;
 	}
+
 	complete(&mfd->msmfb_update_notify);
 	mutex_lock(&msm_fb_notify_update_sem);
 	if (mfd->msmfb_no_update_notify_timer.function)
@@ -2460,7 +2572,7 @@ static int msm_fb_pan_display_sub(struct fb_var_screeninfo *var,
 
 	down(&msm_fb_pan_sem);
 	msm_fb_wait_for_fence(mfd);
-	if (info->node == 0 && !(mfd->cont_splash_done)) { /* primary */
+	if (info->node == 0 && !(mfd->cont_splash_done)) { 
 		mdp_set_dma_pan_info(info, NULL, TRUE);
 		if (msm_fb_blank_sub(FB_BLANK_UNBLANK, info, mfd->op_enable)) {
 			pr_err("%s: can't turn on display!\n", __func__);
@@ -2472,7 +2584,7 @@ static int msm_fb_pan_display_sub(struct fb_var_screeninfo *var,
 
 	mdp_set_dma_pan_info(info, dirtyPtr,
 			     (var->activate & FB_ACTIVATE_VBL));
-	/* async call */
+	
 
 	mdp_dma_pan_update(info);
 	msm_fb_signal_timeline(mfd);
@@ -2481,72 +2593,83 @@ static int msm_fb_pan_display_sub(struct fb_var_screeninfo *var,
 
 	up(&msm_fb_pan_sem);
 
-	if ((mfd->pdev->dev.platform_data) 
-            && ((struct msm_fb_panel_data *)mfd->pdev->dev.platform_data)->sre_ctrl) {
-		mod_timer(&mfd->sre_update_timer, jiffies + msecs_to_jiffies(50));
-	}
-	if ((mfd->pdev->dev.platform_data) 
-            && ((struct msm_fb_panel_data *)mfd->pdev->dev.platform_data)->dimming_on) {
-		mod_timer(&mfd->dimming_update_timer, jiffies + msecs_to_jiffies(1000));
-	}
-
-	if (unset_bl_level && !bl_updated)
-		schedule_delayed_work(&mfd->backlight_worker,
-					backlight_duration);
-
-	if (info->node == 0 && (mfd->cont_splash_done)) /* primary */
+	if (info->node == 0 && (mfd->cont_splash_done)) 
 		mdp_free_splash_buffer(mfd);
 
 	++mfd->panel_info.frame_count;
 	return 0;
 }
 
-void msm_fb_release_busy(struct msm_fb_data_type *mfd)
+static void msm_fb_commit_wq_handler(struct work_struct *work)
 {
+	struct msm_fb_data_type *mfd;
+	struct fb_var_screeninfo *var;
+	struct fb_info *info;
+	struct msm_fb_backup_type *fb_backup;
+	static bool ignore_bkl_zero = false;
+
+	mfd = container_of(work, struct msm_fb_data_type, commit_work);
+	fb_backup = (struct msm_fb_backup_type *)mfd->msm_fb_backup;
+	info = &fb_backup->info;
+
+#if 0
+	if (fb_backup->disp_commit.flags &
+		MDP_DISPLAY_COMMIT_OVERLAY) {
+			mdp4_overlay_commit(info);
+	} else
+#endif
+	{
+		var = &fb_backup->disp_commit.var;
+		msm_fb_pan_display_sub(var, info);
+	}
+
+	if (mfd->request_display_on) {
+		msm_fb_display_on(mfd);
+		if (!ignore_bkl_zero) {
+			PR_DISP_INFO("%s: bl_level %d ignore_bkl_zero %d\n", __func__, mfd->bl_level, ignore_bkl_zero);
+			
+			if (mfd->bl_level == 0)
+				unset_bl_level = DEFAULT_BRIGHTNESS;
+			ignore_bkl_zero = true;
+		}
+		down(&mfd->sem);
+		mfd->request_display_on = FALSE;
+		bl_updated = 0;
+		up(&mfd->sem);
+	}
+	if (unset_bl_level && !bl_updated) {
+		struct msm_fb_panel_data
+		*pdata = (struct msm_fb_panel_data *)mfd->pdev->
+			dev.platform_data;
+		if ((pdata) && (pdata->set_backlight) && mfd->panel_power_on) {
+			down(&mfd->sem);
+			mfd->bl_level = unset_bl_level;
+			pdata->set_backlight(mfd);
+			bl_level_old = unset_bl_level;
+			up(&mfd->sem);
+			bl_updated = 1;
+		}
+	}
+
 	mutex_lock(&mfd->sync_mutex);
 	mfd->is_committing = 0;
 	complete_all(&mfd->commit_comp);
 	mutex_unlock(&mfd->sync_mutex);
-}
-static int msm_fb_commit_thread(void *data)
-{
-	int ret = 0;
-	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *) data;
-	struct fb_var_screeninfo *var;
-	struct fb_info *info;
-	struct msm_fb_backup_type *fb_backup;
-	u32 overlay_commit = false;
 
-	while (!kthread_should_stop()) {
-		ret = wait_event_interruptible(mfd->commit_queue,
-				mfd->wake_commit_thread);
-		if (ret >= 0) {
-			mfd->wake_commit_thread = 0;
-			mutex_lock(&mfd->queue_mutex);
-			while (atomic_read(&mfd->commit_cnt) > 0) {
-				fb_backup = (struct msm_fb_backup_type *)
-					mfd->msm_fb_backup;
-				info = &fb_backup->info;
-				if (fb_backup->disp_commit.flags &
-						MDP_DISPLAY_COMMIT_OVERLAY) {
-					overlay_commit = true;
-					mdp4_overlay_commit(info);
-				} else {
-					var = &fb_backup->disp_commit.var;
-					msm_fb_pan_display_sub(var, info);
-					msm_fb_release_busy(mfd);
-				}
-				if (!bl_updated)
-					schedule_delayed_work(
-							&mfd->backlight_worker,
-							backlight_duration);
-			}
-			if (overlay_commit)
-				mdp4_overlay_commit_finish(info);
-			mutex_unlock(&mfd->queue_mutex);
-		}
-	}
-	return 0;
+#ifdef CONFIG_FB_MSM_CABC_LEVEL_CONTROL
+        if (cabc_level_ctl_status_old != cabc_level_ctl_status) {
+		struct msm_fb_panel_data
+                *pdata = (struct msm_fb_panel_data *)mfd->pdev->
+                        dev.platform_data;
+                if ((pdata) && (pdata->set_cabc)) {
+                        down(&mfd->sem);
+                        pdata->set_cabc(mfd, cabc_level_ctl_status);
+                        cabc_level_ctl_status_old = cabc_level_ctl_status;
+                        up(&mfd->sem);
+                }
+        }
+#endif
+
 }
 
 static int msm_fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
@@ -2595,8 +2718,6 @@ static int msm_fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
 		break;
 
 	case 32:
-		/* Figure out if the user meant RGBA or ARGB
-		   and verify the position of the RGB components */
 
 		if (var->transp.offset == 24) {
 			if ((var->blue.offset != 0) ||
@@ -2611,7 +2732,7 @@ static int msm_fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
 		} else
 			return -EINVAL;
 
-		/* Check the common values for both RGBA and ARGB */
+		
 
 		if ((var->blue.length != 8) ||
 		    (var->green.length != 8) ||
@@ -2752,7 +2873,7 @@ static int msm_fb_stop_sw_refresher(struct msm_fb_data_type *mfd)
 		mfd->sw_currently_refreshing = FALSE;
 		up(&mfd->sem);
 
-		/* wait until the refresher finishes the last job */
+		
 		wait_for_completion_killable(&mfd->refresher_comp);
 	}
 
@@ -2791,7 +2912,7 @@ static int mdp_blit_split_height(struct fb_info *info,
 	int d_x_0, d_x_1, d_w_0, d_w_1, d_y_0, d_y_1, d_h_0, d_h_1;
 
 	splitreq = *req;
-	/* break dest roi at height*/
+	
 	d_x_0 = d_x_1 = req->dst_rect.x;
 	d_w_0 = d_w_1 = req->dst_rect.w;
 	d_y_0 = req->dst_rect.y;
@@ -2809,7 +2930,7 @@ static int mdp_blit_split_height(struct fb_info *info,
 		d_y_1 = d_y_0 + 1;
 	}
 
-	/* blit first region */
+	
 	if (((splitreq.flags & 0x07) == 0x04) ||
 		((splitreq.flags & 0x07) == 0x0)) {
 
@@ -2883,7 +3004,7 @@ static int mdp_blit_split_height(struct fb_info *info,
 	if (ret)
 		return ret;
 
-	/* blit second region */
+	
 	if (((splitreq.flags & 0x07) == 0x04) ||
 		((splitreq.flags & 0x07) == 0x0)) {
 		splitreq.src_rect.h = s_h_1;
@@ -2944,7 +3065,7 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 		return 0;
 
 #if defined CONFIG_FB_MSM_MDP31
-	/* MDP width split workaround */
+	
 	remainder = (req->dst_rect.w)%32;
 	ret = mdp_get_bytes_per_pixel(req->dst.format,
 					(struct msm_fb_data_type *)info->par);
@@ -2958,10 +3079,10 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 	remainder == 22 || remainder == 30)) || remainder == 3 ||
 	(remainder == 1 && req->dst_rect.w != 1) ||
 	(remainder == 2 && req->dst_rect.w != 2)) {
-		/* make new request as provide by user */
+		
 		splitreq = *req;
 
-		/* break dest roi at width*/
+		
 		d_y_0 = d_y_1 = req->dst_rect.y;
 		d_h_0 = d_h_1 = req->dst_rect.h;
 		d_x_0 = req->dst_rect.x;
@@ -2988,7 +3109,7 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 			d_x_1 = d_x_0 + 1;
 		}
 
-		/* blit first region */
+		
 		if (((splitreq.flags & 0x07) == 0x07) ||
 			((splitreq.flags & 0x07) == 0x0)) {
 
@@ -3070,7 +3191,7 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 			ret = mdp_ppp_blit(info, &splitreq);
 		if (ret)
 			return ret;
-		/* blit second region */
+		
 		if (((splitreq.flags & 0x07) == 0x07) ||
 			((splitreq.flags & 0x07) == 0x0)) {
 			splitreq.src_rect.h = s_h_1;
@@ -3107,7 +3228,7 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 		ret = mdp_ppp_blit(info, req);
 	return ret;
 #elif defined CONFIG_FB_MSM_MDP30
-	/* MDP width split workaround */
+	
 	remainder = (req->dst_rect.w)%16;
 	ret = mdp_get_bytes_per_pixel(req->dst.format,
 					(struct msm_fb_data_type *)info->par);
@@ -3119,10 +3240,10 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 
 	if ((is_bpp_4 && (remainder == 6 || remainder == 14))) {
 
-		/* make new request as provide by user */
+		
 		splitreq = *req;
 
-		/* break dest roi at width*/
+		
 		d_y_0 = d_y_1 = req->dst_rect.y;
 		d_h_0 = d_h_1 = req->dst_rect.h;
 		d_x_0 = req->dst_rect.x;
@@ -3135,7 +3256,7 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 		d_w_0 = req->dst_rect.w - d_w_1;
 		d_x_1 = d_x_0 + d_w_0;
 
-		/* blit first region */
+		
 		if (((splitreq.flags & 0x07) == 0x07) ||
 			((splitreq.flags & 0x07) == 0x05) ||
 			((splitreq.flags & 0x07) == 0x02) ||
@@ -3211,13 +3332,13 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 			splitreq.dst_rect.w = d_w_1;
 		}
 
-		/* No need to split in height */
+		
 		ret = mdp_ppp_blit(info, &splitreq);
 
 		if (ret)
 			return ret;
 
-		/* blit second region */
+		
 		if (((splitreq.flags & 0x07) == 0x07) ||
 			((splitreq.flags & 0x07) == 0x05) ||
 			((splitreq.flags & 0x07) == 0x02) ||
@@ -3241,7 +3362,7 @@ int mdp_blit(struct fb_info *info, struct mdp_blit_req *req)
 			splitreq.dst_rect.w = d_w_0;
 		}
 
-		/* No need to split in height ... just width */
+		
 		ret = mdp_ppp_blit(info, &splitreq);
 
 		if (ret)
@@ -3263,13 +3384,6 @@ static inline void msm_fb_dma_barrier_for_rect(struct fb_info *info,
 			msm_dma_barrier_function_pointer dma_barrier_fp
 			)
 {
-	/*
-	 * Compute the start and end addresses of the rectangles.
-	 * NOTE: As currently implemented, the data between
-	 *       the end of one row and the start of the next is
-	 *       included in the address range rather than
-	 *       doing multiple calls for each row.
-	 */
 	unsigned long start;
 	size_t size;
 	char * const pmem_start = info->screen_base;
@@ -3324,14 +3438,6 @@ static inline void msm_dma_fromdevice_wb_post(void *start, size_t size)
 	dma_cache_post_ops(start, size, DMA_FROM_DEVICE);
 }
 
-/*
- * Do the write barriers required to guarantee data is committed to RAM
- * (from CPU cache or internal buffers) before a DMA operation starts.
- * NOTE: As currently implemented, the data between
- *       the end of one row and the start of the next is
- *       included in the address range rather than
- *       doing multiple calls for each row.
-*/
 static void msm_fb_ensure_memory_coherency_before_dma(struct fb_info *info,
 		struct mdp_blit_req *req_list,
 		int req_list_count)
@@ -3339,24 +3445,11 @@ static void msm_fb_ensure_memory_coherency_before_dma(struct fb_info *info,
 #ifdef CONFIG_ARCH_QSD8X50
 	int i;
 
-	/*
-	 * Normally, do the requested barriers for each address
-	 * range that corresponds to a rectangle.
-	 *
-	 * But if at least one write barrier is requested for data
-	 * going to or from the device but no address range is
-	 * needed for that barrier, then do the barrier, but do it
-	 * only once, no matter how many requests there are.
-	 */
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
 	switch (mfd->mdp_fb_page_protection)	{
 	default:
 	case MDP_FB_PAGE_PROTECTION_NONCACHED:
 	case MDP_FB_PAGE_PROTECTION_WRITECOMBINE:
-		/*
-		 * The following barrier is only done at most once,
-		 * since further calls would be redundant.
-		 */
 		for (i = 0; i < req_list_count; i++) {
 			if (!(req_list[i].flags
 				& MDP_NO_DMA_BARRIER_START)) {
@@ -3367,10 +3460,6 @@ static void msm_fb_ensure_memory_coherency_before_dma(struct fb_info *info,
 		break;
 
 	case MDP_FB_PAGE_PROTECTION_WRITETHROUGHCACHE:
-		/*
-		 * The following barrier is only done at most once,
-		 * since further calls would be redundant.
-		 */
 		for (i = 0; i < req_list_count; i++) {
 			if (!(req_list[i].flags
 				& MDP_NO_DMA_BARRIER_START)) {
@@ -3407,14 +3496,6 @@ static void msm_fb_ensure_memory_coherency_before_dma(struct fb_info *info,
 }
 
 
-/*
- * Do the write barriers required to guarantee data will be re-read from RAM by
- * the CPU after a DMA operation ends.
- * NOTE: As currently implemented, the data between
- *       the end of one row and the start of the next is
- *       included in the address range rather than
- *       doing multiple calls for each row.
-*/
 static void msm_fb_ensure_memory_coherency_after_dma(struct fb_info *info,
 		struct mdp_blit_req *req_list,
 		int req_list_count)
@@ -3427,10 +3508,6 @@ static void msm_fb_ensure_memory_coherency_after_dma(struct fb_info *info,
 	default:
 	case MDP_FB_PAGE_PROTECTION_NONCACHED:
 	case MDP_FB_PAGE_PROTECTION_WRITECOMBINE:
-		/*
-		 * The following barrier is only done at most once,
-		 * since further calls would be redundant.
-		 */
 		for (i = 0; i < req_list_count; i++) {
 			if (!(req_list[i].flags
 				& MDP_NO_DMA_BARRIER_END)) {
@@ -3473,23 +3550,8 @@ static void msm_fb_ensure_memory_coherency_after_dma(struct fb_info *info,
 #endif
 }
 
-/*
- * NOTE: The userspace issues blit operations in a sequence, the sequence
- * start with a operation marked START and ends in an operation marked
- * END. It is guranteed by the userspace that all the blit operations
- * between START and END are only within the regions of areas designated
- * by the START and END operations and that the userspace doesnt modify
- * those areas. Hence it would be enough to perform barrier/cache operations
- * only on the START and END operations.
- */
 static int msmfb_blit(struct fb_info *info, void __user *p)
 {
-	/*
-	 * CAUTION: The names of the struct types intentionally *DON'T* match
-	 * the names of the variables declared -- they appear to be swapped.
-	 * Read the code carefully and you should see that the variable names
-	 * make sense.
-	 */
 	const int MAX_LIST_WINDOW = 16;
 	struct mdp_blit_req req_list[MAX_LIST_WINDOW];
 	struct mdp_blit_req_list req_list_header;
@@ -3501,7 +3563,7 @@ static int msmfb_blit(struct fb_info *info, void __user *p)
 		       __func__, info->node);
 		return -EPERM;
 	}
-	/* Get the count size for the total BLIT request. */
+	
 	if (copy_from_user(&req_list_header, p, sizeof(req_list_header)))
 		return -EFAULT;
 	p += sizeof(req_list_header);
@@ -3509,14 +3571,6 @@ static int msmfb_blit(struct fb_info *info, void __user *p)
 	if (count < 0 || count >= MAX_BLIT_REQ)
 		return -EINVAL;
 	while (count > 0) {
-		/*
-		 * Access the requests through a narrow window to decrease copy
-		 * overhead and make larger requests accessible to the
-		 * coherency management code.
-		 * NOTE: The window size is intended to be larger than the
-		 *       typical request size, but not require more than 2
-		 *       kbytes of stack storage.
-		 */
 		req_list_count = count;
 		if (req_list_count > MAX_LIST_WINDOW)
 			req_list_count = MAX_LIST_WINDOW;
@@ -3532,34 +3586,21 @@ static int msmfb_blit(struct fb_info *info, void __user *p)
 		msm_fb_ensure_memory_coherency_before_dma(info,
 				req_list, req_list_count);
 
-		/*
-		 * Do the blit DMA, if required -- returning early only if
-		 * there is a failure.
-		 */
 		for (i = 0; i < req_list_count; i++) {
 			if (!(req_list[i].flags & MDP_NO_BLIT)) {
-				/* Do the actual blit. */
+				
 				int ret = mdp_blit(info, &(req_list[i]));
 
-				/*
-				 * Note that early returns don't guarantee
-				 * memory coherency.
-				 */
 				if (ret)
 					return ret;
 			}
 		}
 
-		/*
-		 * Ensure that CPU cache and other internal CPU state is
-		 * updated to reflect any change in memory modified by MDP blit
-		 * DMA.
-		 */
 		msm_fb_ensure_memory_coherency_after_dma(info,
 				req_list,
 				req_list_count);
 
-		/* Go to next window of requests. */
+		
 		count -= req_list_count;
 		p += sizeof(struct mdp_blit_req)*req_list_count;
 	}
@@ -3671,7 +3712,7 @@ static int msmfb_overlay_play_wait(struct fb_info *info, unsigned long *argp)
 	struct msmfb_overlay_data req;
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
 
-	if (mfd->overlay_play_enable == 0)      /* nothing to do */
+	if (mfd->overlay_play_enable == 0)      
 		return 0;
 
 	ret = copy_from_user(&req, argp, sizeof(req));
@@ -3690,8 +3731,9 @@ static int msmfb_overlay_play(struct fb_info *info, unsigned long *argp)
 	int	ret;
 	struct msmfb_overlay_data req;
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
+	struct msm_fb_panel_data *pdata;
 
-	if (mfd->overlay_play_enable == 0)	/* nothing to do */
+	if (mfd->overlay_play_enable == 0)	
 		return 0;
 
 	ret = copy_from_user(&req, argp, sizeof(req));
@@ -3701,7 +3743,7 @@ static int msmfb_overlay_play(struct fb_info *info, unsigned long *argp)
 		return ret;
 	}
 
-	if (info->node == 0 && !(mfd->cont_splash_done)) { /* primary */
+	if (info->node == 0 && !(mfd->cont_splash_done)) { 
 		mdp_set_dma_pan_info(info, NULL, TRUE);
 		if (msm_fb_blank_sub(FB_BLANK_UNBLANK, info, mfd->op_enable)) {
 			pr_err("%s: can't turn on display!\n", __func__);
@@ -3709,7 +3751,7 @@ static int msmfb_overlay_play(struct fb_info *info, unsigned long *argp)
 		}
 	}
 
-	if (!mfd->panel_power_on) /* suspended */
+	if (!mfd->panel_power_on) 
 		return -EPERM;
 
 	complete(&mfd->msmfb_update_notify);
@@ -3723,7 +3765,20 @@ static int msmfb_overlay_play(struct fb_info *info, unsigned long *argp)
 
 	ret = mdp4_overlay_play(info, &req);
 
-	if (info->node == 0 && (mfd->cont_splash_done)) /* primary */
+	if (unset_bl_level && !bl_updated) {
+		pdata = (struct msm_fb_panel_data *)mfd->pdev->
+			dev.platform_data;
+		if ((pdata) && (pdata->set_backlight)) {
+			down(&mfd->sem);
+			mfd->bl_level = unset_bl_level;
+			pdata->set_backlight(mfd);
+			bl_level_old = unset_bl_level;
+			up(&mfd->sem);
+			bl_updated = 1;
+		}
+	}
+
+	if (info->node == 0 && (mfd->cont_splash_done)) 
 		mdp_free_splash_buffer(mfd);
 
 	return ret;
@@ -3869,6 +3924,26 @@ error:
 	return ret;
 }
 
+static int msmfb_overlay_ioctl_writeback_play(
+	struct fb_info *info, unsigned long *argp)
+{
+	int ret;
+	struct msmfb_overlay_data req;
+
+	ret = copy_from_user(&req, argp, sizeof(req));
+	if (ret)
+		goto error;
+
+	ret = mdp4_writeback_play(info, &req);
+
+error:
+	if (ret) {
+		pr_err("%s:msmfb_overlay_writeback_play ioctl failed\n",
+				__func__);
+	}
+	return ret;
+}
+
 #else
 static int msmfb_overlay_ioctl_writeback_init(struct fb_info *info)
 {
@@ -3904,6 +3979,11 @@ static int msmfb_overlay_ioctl_writeback_terminate(struct fb_info *info)
 
 static int msmfb_overlay_ioctl_writeback_set_mirr_hint(struct fb_info *
 		info, void *argp)
+{
+	return -ENOTSUPP;
+}
+
+static int msmfb_overlay_ioctl_writeback_play(struct fb_info *info, unsigned long *argp)
 {
 	return -ENOTSUPP;
 }
@@ -3952,7 +4032,6 @@ static int msmfb_mixer_info(struct fb_info *info, unsigned long *argp)
 DEFINE_SEMAPHORE(msm_fb_ioctl_ppp_sem);
 DEFINE_MUTEX(msm_fb_ioctl_lut_sem);
 
-/* Set color conversion matrix from user space */
 
 #ifndef CONFIG_FB_MSM_MDP40
 static void msmfb_set_color_conv(struct mdp_ccs *p)
@@ -3960,10 +4039,10 @@ static void msmfb_set_color_conv(struct mdp_ccs *p)
 	int i;
 
 	if (p->direction == MDP_CCS_RGB2YUV) {
-		/* MDP cmd block enable */
+		
 		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
 
-		/* RGB->YUV primary forward matrix */
+		
 		for (i = 0; i < MDP_CCS_SIZE; i++)
 			writel(p->ccs[i], MDP_CSC_PFMVn(i));
 
@@ -3972,19 +4051,19 @@ static void msmfb_set_color_conv(struct mdp_ccs *p)
 			writel(p->bv[i], MDP_CSC_POST_BV2n(i));
 		#endif
 
-		/* MDP cmd block disable */
+		
 		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 	} else {
-		/* MDP cmd block enable */
+		
 		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
 
-		/* YUV->RGB primary reverse matrix */
+		
 		for (i = 0; i < MDP_CCS_SIZE; i++)
 			writel(p->ccs[i], MDP_CSC_PRMVn(i));
 		for (i = 0; i < MDP_BV_SIZE; i++)
 			writel(p->bv[i], MDP_CSC_PRE_BV1n(i));
 
-		/* MDP cmd block disable */
+		
 		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 	}
 }
@@ -4137,20 +4216,18 @@ static int msmfb_handle_buf_sync_ioctl(struct msm_fb_data_type *mfd,
 	if (buf_sync->flags & MDP_BUF_SYNC_FLAG_WAIT) {
 		msm_fb_wait_for_fence(mfd);
 	}
-	if ((mfd->panel.type == WRITEBACK_PANEL) ||
-		(mfd->panel.type == MIPI_CMD_PANEL))
+	if (mfd->panel.type == WRITEBACK_PANEL)
 		threshold = 1;
 	else
 		threshold = 2;
 	mfd->cur_rel_sync_pt = sw_sync_pt_create(mfd->timeline,
-			mfd->timeline_value + threshold +
-			atomic_read(&mfd->commit_cnt));
+			mfd->timeline_value + threshold);
 	if (mfd->cur_rel_sync_pt == NULL) {
 		pr_err("%s: cannot create sync point", __func__);
 		ret = -ENOMEM;
 		goto buf_sync_err_1;
 	}
-	/* create fence */
+	
 	mfd->cur_rel_fence = sync_fence_create("mdp-fence",
 			mfd->cur_rel_sync_pt);
 	if (mfd->cur_rel_fence == NULL) {
@@ -4160,7 +4237,7 @@ static int msmfb_handle_buf_sync_ioctl(struct msm_fb_data_type *mfd,
 		ret = -ENOMEM;
 		goto buf_sync_err_1;
 	}
-	/* create fd */
+	
 	mfd->cur_rel_fen_fd = get_unused_fd_flags(0);
 	if (mfd->cur_rel_fen_fd < 0) {
 		pr_err("%s: get_unused_fd_flags failed", __func__);
@@ -4244,6 +4321,8 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 	struct mdp_buf_sync buf_sync;
 	struct msmfb_metadata mdp_metadata;
 	int ret = 0;
+	struct msmfb_usb_projector_info tmp_info;
+
 	msm_fb_pan_idle(mfd);
 
 	switch (cmd) {
@@ -4252,6 +4331,8 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 		ret = msmfb_overlay_get(info, argp);
 		break;
 	case MSMFB_OVERLAY_SET:
+		if (!mfd->panel_power_on)
+			return -EPERM;
 		ret = msmfb_overlay_set(info, argp);
 		break;
 	case MSMFB_OVERLAY_UNSET:
@@ -4301,6 +4382,9 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 		ret = msmfb_overlay_ioctl_writeback_set_mirr_hint(
 				info, argp);
 		break;
+	case MSMFB_WRITEBACK_PLAY:
+		ret = msmfb_overlay_ioctl_writeback_play(info, argp);
+		break;
 #endif
 	case MSMFB_VSYNC_CTRL:
 	case MSMFB_OVERLAY_VSYNC_CTRL:
@@ -4318,7 +4402,7 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 
 		break;
 
-	/* Ioctl for setting ccs matrix from user space */
+	
 	case MSMFB_SET_CCS_MATRIX:
 #ifndef CONFIG_FB_MSM_MDP40
 		ret = copy_from_user(&ccs_matrix, argp, sizeof(ccs_matrix));
@@ -4352,7 +4436,7 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 
 		break;
 
-	/* Ioctl for getting ccs matrix to user space */
+	
 	case MSMFB_GET_CCS_MATRIX:
 #ifndef CONFIG_FB_MSM_MDP40
 		ret = copy_from_user(&ccs_matrix, argp, sizeof(ccs_matrix)) ;
@@ -4496,14 +4580,14 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 		if (ret)
 				return ret;
 
-		/* Validate the proposed page protection settings. */
+		
 		switch (fb_page_protection.page_protection)	{
 		case MDP_FB_PAGE_PROTECTION_NONCACHED:
 		case MDP_FB_PAGE_PROTECTION_WRITECOMBINE:
 		case MDP_FB_PAGE_PROTECTION_WRITETHROUGHCACHE:
-		/* Write-back cache (read allocate)  */
+		
 		case MDP_FB_PAGE_PROTECTION_WRITEBACKCACHE:
-		/* Write-back cache (write allocate) */
+		
 		case MDP_FB_PAGE_PROTECTION_WRITEBACKWACACHE:
 			mfd->mdp_fb_page_protection =
 				fb_page_protection.page_protection;
@@ -4513,10 +4597,6 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 			break;
 		}
 #else
-		/*
-		 * Don't allow caching until 7k DMA cache operations are
-		 * available.
-		 */
 		ret = -EINVAL;
 #endif
 		break;
@@ -4545,6 +4625,19 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 		ret = msmfb_display_commit(info, argp);
 		break;
 
+	case MSMFB_USBFB_INIT:
+		ret = minifb_ioctl_handler(MINIFB_INIT, argp);
+		break;
+	case MSMFB_USBFB_TERMINATE:
+		ret = minifb_ioctl_handler(MINIFB_TERMINATE, argp);
+		break;
+	case MSMFB_USBFB_QUEUE_BUFFER:
+		ret = minifb_ioctl_handler(MINIFB_QUEUE_BUFFER, argp);
+		break;
+	case MSMFB_USBFB_DEQUEUE_BUFFER:
+		ret = minifb_ioctl_handler(MINIFB_DEQUEUE_BUFFER, argp);
+		break;
+
 	case MSMFB_METADATA_GET:
 		ret = copy_from_user(&mdp_metadata, argp, sizeof(mdp_metadata));
 		if (ret)
@@ -4553,11 +4646,102 @@ static int msm_fb_ioctl(struct fb_info *info, unsigned int cmd,
 		if (!ret)
 			ret = copy_to_user(argp, &mdp_metadata,
 				sizeof(mdp_metadata));
+		break;
 
+	case MSMFB_GET_USB_PROJECTOR_INFO:
+		ret = copy_to_user(argp, &usb_pjt_info, sizeof(usb_pjt_info));
+		if (ret)
+			return ret;
+		break;
+	case MSMFB_SET_USB_PROJECTOR_INFO:
+	{
+		int i;
+		ret = copy_from_user(&tmp_info, argp, sizeof(tmp_info));
+		if (!tmp_info.latest_offset) {
+			
+			usb_pjt_info.latest_offset = 0;
+			mem_mapped = 0;
+			for (i=0; i<NUM_ALLOC; i++) {
+				if (usb_pjt_client && usb_pjt_handle[i]) {
+					ion_unmap_kernel(usb_pjt_client, usb_pjt_handle[i]);
+					ion_free(usb_pjt_client, usb_pjt_handle[i]);
+					usb_pjt_handle[i] = NULL;
+				}
+				mem_fd[i] = 0;
+			}
+		} else {
+			if (mem_mapped >= NUM_ALLOC) {
+				
+#if 0
+				mm_segment_t oldfs;
+				struct file *fp;
+#endif
+				usb_pjt_info.latest_offset = tmp_info.latest_offset;
+#if 0
+				oldfs = get_fs();
+				set_fs(KERNEL_DS);
+				fp=filp_open("/data/dump.rgb" , O_RDWR|O_CREAT|O_TRUNC, 0666);
+				for (i=0; i<NUM_ALLOC; i++){
+					if (mem_fd[i] == usb_pjt_info.latest_offset){
+							fp->f_op->write(fp,virt_addr[i], 480*800*2, &fp->f_pos);
+						}
+				}
+				filp_close(fp, NULL);
+				set_fs(oldfs);
+#endif
+				break;
+			}
+			
+			for (i=0; i<NUM_ALLOC; i++) {
+				unsigned long ionflag;
+				if (mem_fd[i]) {
+					usb_pjt_info.latest_offset = tmp_info.latest_offset;
+					if (mem_fd[i] == tmp_info.latest_offset) {
+						MSM_FB_ERR("fd %d just received again.\n", mem_fd[i]);
+						break;
+					} else
+						continue;
+				}
+				if (!usb_pjt_client) {
+					MSM_FB_ERR("No ION client created.\n");
+					break;
+				}
+				usb_pjt_handle[i] = ion_import_dma_buf(usb_pjt_client, tmp_info.latest_offset);
+				if (!usb_pjt_handle[i]) {
+					MSM_FB_ERR("Failed to get ION handle, client %p, fd = %d\n",
+						usb_pjt_client, tmp_info.latest_offset);
+					break;
+				}
+				ret = ion_handle_get_flags(usb_pjt_client, usb_pjt_handle[i], &ionflag);
+				if (ret) {
+					MSM_FB_ERR("Failed to get ION flag, client %p, handle %p, fd = %d\n",
+						usb_pjt_client, usb_pjt_handle[i], tmp_info.latest_offset);
+					break;
+				}
+				virt_addr[i] = ion_map_kernel(usb_pjt_client, usb_pjt_handle[i]);
+				mem_fd[i] = tmp_info.latest_offset;
+				usb_pjt_info.latest_offset = tmp_info.latest_offset;
+				MSM_FB_INFO("%s: fd = %d, virt %p\n", __func__, mem_fd[i], virt_addr[i]);
+				mem_mapped++;
+				break;
+			}
+		}
+		if (ret)
+			return ret;
+		break;
+	}
+	case MSMFB_SET_DISP_PROJECTOR_INFO:
+		ret = copy_from_user(&disp_pjt_info, argp, sizeof(disp_pjt_info));
+		MSM_FB_INFO("%s: device (%d, %d), client (%d, %d)\n", __func__,
+			disp_pjt_info.device_width, disp_pjt_info.device_height,
+			disp_pjt_info.client_width, disp_pjt_info.client_height);
+		if (ret)
+			return ret;
 		break;
 
 	default:
-		MSM_FB_INFO("MDP: unknown ioctl (cmd=%x) received!\n", cmd);
+		MSM_FB_INFO("MDP: unknown ioctl (cmd=%x, type=0x%x, nr=0x%x) received!\n",
+			cmd, _IOC_TYPE(cmd), _IOC_NR(cmd));
 		ret = -EINVAL;
 		break;
 	}
@@ -4667,9 +4851,6 @@ struct platform_device *msm_fb_add_device(struct platform_device *pdev)
 		printk(KERN_ERR "msm_fb: no more framebuffer info list!\n");
 		return NULL;
 	}
-	/*
-	 * alloc panel device data
-	 */
 	this_dev = msm_fb_device_alloc(pdata, type, id);
 
 	if (!this_dev) {
@@ -4678,9 +4859,6 @@ struct platform_device *msm_fb_add_device(struct platform_device *pdev)
 		return NULL;
 	}
 
-	/*
-	 * alloc framebuffer info + par data
-	 */
 	fbi = framebuffer_alloc(sizeof(struct msm_fb_data_type), NULL);
 	if (fbi == NULL) {
 		platform_device_put(this_dev);
@@ -4697,15 +4875,12 @@ struct platform_device *msm_fb_add_device(struct platform_device *pdev)
 	mfd->index = fbi_list_index;
 	mfd->mdp_fb_page_protection = MDP_FB_PAGE_PROTECTION_WRITECOMBINE;
 	mfd->iclient = iclient;
-	/* link to the latest pdev */
+	
 	mfd->pdev = this_dev;
 
 	mfd_list[mfd_list_index++] = mfd;
 	fbi_list[fbi_list_index++] = fbi;
 
-	/*
-	 * set driver data
-	 */
 	platform_set_drvdata(this_dev, mfd);
 
 	if (platform_device_add(this_dev)) {
@@ -4725,7 +4900,7 @@ int get_fb_phys_info(unsigned long *start, unsigned long *len, int fb_num,
 	struct fb_info *info;
 	struct msm_fb_data_type *mfd;
 
-	if (fb_num > MAX_FBI_LIST ||
+	if (fb_num >= MAX_FBI_LIST ||
 		(subsys_id != DISPLAY_SUBSYSTEM_ID &&
 		 subsys_id != ROTATOR_SUBSYSTEM_ID)) {
 		pr_err("%s(): Invalid parameters\n", __func__);
@@ -4765,6 +4940,11 @@ int __init msm_fb_init(void)
 	if (msm_fb_register_driver())
 		return rc;
 
+#ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
+	usb_pjt_client = msm_ion_client_create(-1, ION_CLIENT_FB_PJT);
+#endif
+
+
 #ifdef MSM_FB_ENABLE_DBGFS
 	{
 		struct dentry *root;
@@ -4785,7 +4965,6 @@ int __init msm_fb_init(void)
 	return 0;
 }
 
-/* Called by v4l2 driver to enable/disable overlay pipe */
 int msm_fb_v4l2_enable(struct mdp_overlay *req, bool enable, void **par)
 {
 	int err = 0;
@@ -4816,7 +4995,6 @@ int msm_fb_v4l2_enable(struct mdp_overlay *req, bool enable, void **par)
 }
 EXPORT_SYMBOL(msm_fb_v4l2_enable);
 
-/* Called by v4l2 driver to provide a frame for display */
 int msm_fb_v4l2_update(void *par,
 	unsigned long srcp0_addr, unsigned long srcp0_size,
 	unsigned long srcp1_addr, unsigned long srcp1_size,
@@ -4838,5 +5016,17 @@ int msm_fb_v4l2_update(void *par,
 #endif
 }
 EXPORT_SYMBOL(msm_fb_v4l2_update);
+
+int msm_fb_mixer_pan_idle(DISP_TARGET_PHYS pdest)
+{
+	size_t i;
+	for (i = 0; i < mfd_list_index; ++i) {
+		struct msm_fb_data_type *mfd = mfd_list[i];
+		if (mfd->panel_info.pdest == pdest)
+			return msm_fb_pan_idle(mfd);
+	}
+	return 0;
+}
+EXPORT_SYMBOL(msm_fb_mixer_pan_idle);
 
 module_init(msm_fb_init);

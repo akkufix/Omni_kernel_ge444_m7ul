@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -18,6 +18,7 @@
 #include <linux/msm_ion.h>
 #include <linux/gpio.h>
 #include <linux/coresight.h>
+#include <linux/avtimer.h>
 #include <asm/clkdev.h>
 #include <mach/kgsl.h>
 #include <linux/android_pmem.h>
@@ -108,6 +109,9 @@
 
 #define MSM8960_HSUSB_PHYS		0x12500000
 #define MSM8960_HSUSB_SIZE		SZ_4K
+
+#define AVTIMER_MSW_PHYSICAL_ADDRESS 0x2800900C
+#define AVTIMER_LSW_PHYSICAL_ADDRESS 0x28009008
 
 struct flash_platform_data msm_nand_data = {
 	.parts		= NULL,
@@ -917,7 +921,6 @@ struct msm_vidc_platform_data vidc_platform_data = {
 	.disable_fullhd = 0,
 	.cont_mode_dpb_count = 18,
 	.fw_addr = 0x9fe00000,
-	.enable_sec_metadata = 0,
 };
 
 struct platform_device msm_device_vidc = {
@@ -2209,8 +2212,8 @@ struct platform_device msm_multi_ch_pcm = {
 };
 
 struct platform_device msm_lowlatency_pcm = {
-	.name	= "msm-lowlatency-pcm-dsp",
-	.id	= -1,
+   .name   = "msm-lowlatency-pcm-dsp",
+   .id = -1,
 };
 
 struct platform_device msm_pcm_routing = {
@@ -2239,8 +2242,13 @@ struct platform_device msm8960_cpudai_slimbus_2_tx = {
 };
 
 struct msm_mi2s_pdata mi2s_data = {
+#ifdef CONFIG_MACH_ZIP_CL_MI2S_DATA_SWITCH
+	.rx_sd_lines = MSM_MI2S_SD3 ,   
+	.tx_sd_lines = MSM_MI2S_SD0 ,   
+#else
 	.rx_sd_lines = MSM_MI2S_SD0 ,   
 	.tx_sd_lines = MSM_MI2S_SD3 ,   
+#endif
 };
 
 struct platform_device msm_cpudai_mi2s = {
@@ -2443,8 +2451,6 @@ static struct fs_driver_data mdp_fs_data = {
 		{ .name = "lut_clk" },
 		{ .name = "tv_src_clk" },
 		{ .name = "tv_clk" },
-		{ .name = "reset1_clk" },
-		{ .name = "reset2_clk" },
 		{ 0 }
 	},
 	.bus_port0 = MSM_BUS_MASTER_MDP_PORT0,
@@ -2905,89 +2911,46 @@ struct platform_device msm_slim_ctrl = {
 };
 
 static struct msm_dcvs_freq_entry grp3d_freq[] = {
-	{0, 900, 0, 0, 0},
-	{0, 950, 0, 0, 0},
-	{0, 950, 0, 0, 0},
-	{0, 1200, 1, 100, 100},
+	{0, 0, 333932},
+	{0, 0, 497532},
+	{0, 0, 707610},
+	{0, 0, 844545},
 };
 
 static struct msm_dcvs_freq_entry grp2d_freq[] = {
-	{0, 900, 0, 0, 0},
-	{0, 950, 1, 100, 100},
+	{0, 0, 86000},
+	{0, 0, 200000},
 };
 
 static struct msm_dcvs_core_info grp3d_core_info = {
-	.freq_tbl	= &grp3d_freq[0],
-	.core_param	= {
-		.core_type	= MSM_DCVS_CORE_TYPE_GPU,
+	.freq_tbl = &grp3d_freq[0],
+	.core_param = {
+		.max_time_us = 100000,
+		.num_freq = ARRAY_SIZE(grp3d_freq),
 	},
-	.algo_param	= {
-		.disable_pc_threshold		= 0,
-		.em_win_size_min_us		= 100000,
-		.em_win_size_max_us		= 300000,
-		.em_max_util_pct		= 97,
-		.group_id			= 0,
-		.max_freq_chg_time_us		= 100000,
-		.slack_mode_dynamic		= 0,
-		.slack_weight_thresh_pct	= 0,
-		.slack_time_min_us		= 39000,
-		.slack_time_max_us		= 39000,
-		.ss_win_size_min_us		= 1000000,
-		.ss_win_size_max_us		= 1000000,
-		.ss_util_pct			= 95,
-		.ss_no_corr_below_freq		= 0,
+	.algo_param = {
+		.slack_time_us = 39000,
+		.disable_pc_threshold = 86000,
+		.ss_window_size = 1000000,
+		.ss_util_pct = 95,
+		.em_max_util_pct = 97,
+		.ss_iobusy_conv = 100,
 	},
-	.energy_coeffs	= {
-		.active_coeff_a		= 2492,
-		.active_coeff_b		= 0,
-		.active_coeff_c		= 0,
-
-		.leakage_coeff_a	= -17720,
-		.leakage_coeff_b	= 37,
-		.leakage_coeff_c	= 2729,
-		.leakage_coeff_d	= -277,
-	},
-	.power_param	= {
-		.current_temp	= 25,
-		.num_freq	= ARRAY_SIZE(grp3d_freq),
-	}
 };
 
 static struct msm_dcvs_core_info grp2d_core_info = {
-	.freq_tbl	= &grp2d_freq[0],
-	.core_param	= {
-		.core_type	= MSM_DCVS_CORE_TYPE_GPU,
+	.freq_tbl = &grp2d_freq[0],
+	.core_param = {
+		.max_time_us = 100000,
+		.num_freq = ARRAY_SIZE(grp2d_freq),
 	},
-	.algo_param	= {
-		.disable_pc_threshold		= 0,
-		.em_win_size_min_us		= 100000,
-		.em_win_size_max_us		= 300000,
-		.em_max_util_pct		= 97,
-		.group_id			= 0,
-		.max_freq_chg_time_us		= 100000,
-		.slack_mode_dynamic		= 0,
-		.slack_weight_thresh_pct	= 0,
-		.slack_time_min_us		= 39000,
-		.slack_time_max_us		= 39000,
-		.ss_win_size_min_us		= 1000000,
-		.ss_win_size_max_us		= 1000000,
-		.ss_util_pct			= 95,
-		.ss_no_corr_below_freq		= 0,
+	.algo_param = {
+		.slack_time_us = 39000,
+		.disable_pc_threshold = 90000,
+		.ss_window_size = 1000000,
+		.ss_util_pct = 90,
+		.em_max_util_pct = 95,
 	},
-	.energy_coeffs	= {
-		.active_coeff_a		= 2492,
-		.active_coeff_b		= 0,
-		.active_coeff_c		= 0,
-
-		.leakage_coeff_a	= -17720,
-		.leakage_coeff_b	= 37,
-		.leakage_coeff_c	= 2729,
-		.leakage_coeff_d	= -277,
-	},
-	.power_param	= {
-		.current_temp	= 25,
-		.num_freq	= ARRAY_SIZE(grp2d_freq),
-	}
 };
 
 #ifdef CONFIG_MSM_BUS_SCALING
@@ -3925,57 +3888,40 @@ struct platform_device msm8960_cpu_idle_device = {
 	},
 };
 
-static struct msm_dcvs_core_info msm8960_core_info = {
-	.num_cores		= 4,
-	.sensors		= (int[]){7, 8, 9, 10},
-	.thermal_poll_ms	= 60000,
-	.core_param		= {
-		.core_type	= MSM_DCVS_CORE_TYPE_CPU,
-	},
-	.algo_param		= {
-		.disable_pc_threshold		= 1458000,
-		.em_win_size_min_us		= 100000,
-		.em_win_size_max_us		= 300000,
-		.em_max_util_pct		= 97,
-		.group_id			= 1,
-		.max_freq_chg_time_us		= 100000,
-		.slack_mode_dynamic		= 0,
-		.slack_weight_thresh_pct	= 3,
-		.slack_time_min_us		= 45000,
-		.slack_time_max_us		= 45000,
-		.ss_no_corr_below_freq		= 0,
-		.ss_win_size_min_us		= 1000000,
-		.ss_win_size_max_us		= 1000000,
-		.ss_util_pct			= 95,
-	},
-	.energy_coeffs		= {
-		.active_coeff_a		= 336,
-		.active_coeff_b		= 0,
-		.active_coeff_c		= 0,
+static struct msm_dcvs_freq_entry msm8960_freq[] = {
+	{ 384000, 166981,  345600},
+	{ 702000, 213049,  632502},
+	{1026000, 285712,  925613},
+	{1242000, 383945, 1176550},
+	{1458000, 419729, 1465478},
+	{1512000, 434116, 1546674},
 
-		.leakage_coeff_a	= -17720,
-		.leakage_coeff_b	= 37,
-		.leakage_coeff_c	= 3329,
-		.leakage_coeff_d	= -277,
-	},
-	.power_param		= {
-		.current_temp	= 25,
-		.num_freq	= 0, /* set at runtime */
-	}
 };
 
-#define MSM8960_LPM_LATENCY  1000 /* >100 usec for WFI */
-
-static struct msm_gov_platform_data gov_platform_data = {
-	.info = &msm8960_core_info,
-	.latency = MSM8960_LPM_LATENCY,
+static struct msm_dcvs_core_info msm8960_core_info = {
+	.freq_tbl = &msm8960_freq[0],
+	.core_param = {
+		.max_time_us = 100000,
+		.num_freq = ARRAY_SIZE(msm8960_freq),
+	},
+	.algo_param = {
+		.slack_time_us = 58000,
+		.scale_slack_time = 0,
+		.scale_slack_time_pct = 0,
+		.disable_pc_threshold = 1458000,
+		.em_window_size = 100000,
+		.em_max_util_pct = 97,
+		.ss_window_size = 1000000,
+		.ss_util_pct = 95,
+		.ss_iobusy_conv = 100,
+	},
 };
 
 struct platform_device msm8960_msm_gov_device = {
 	.name = "msm_dcvs_gov",
 	.id = -1,
 	.dev = {
-		.platform_data = &gov_platform_data,
+		.platform_data = &msm8960_core_info,
 	},
 };
 
@@ -4187,6 +4133,11 @@ struct platform_device msm8960_cache_dump_device = {
 	.dev            = {
 		.platform_data = &msm8960_cache_dump_pdata,
 	},
+};
+
+struct dev_avtimer_data dev_avtimer_pdata = {
+	.avtimer_msw_phy_addr = AVTIMER_MSW_PHYSICAL_ADDRESS,
+	.avtimer_lsw_phy_addr = AVTIMER_LSW_PHYSICAL_ADDRESS,
 };
 
 #define MDM2AP_ERRFATAL			40

@@ -17,6 +17,8 @@
 
 #define ROTATOR_VERSION_01	0xA5B4C301
 
+#define ROTATOR_FLAGS_BIT_PERFORMANCE  (1 << 0)
+
 enum rotator_clk_type {
 	ROTATOR_CORE_CLK,
 	ROTATOR_PCLK,
@@ -30,12 +32,6 @@ struct msm_rotator_buf_sync {
 	int rel_fen_fd;
 };
 
-struct rot_buf_type {
-	struct ion_handle *ihdl;
-	uint32_t write_addr;
-	uint32_t read_addr;
-};
-
 struct msm_rotator_img_info {
 	unsigned int session_id;
 	struct msmfb_img  src;
@@ -47,6 +43,7 @@ struct msm_rotator_img_info {
 	int enable;
 	unsigned int	downscale_ratio;
 	unsigned int secure;
+	unsigned int flags;
 };
 
 struct msm_rotator_data_info {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -51,15 +51,12 @@ struct hdmi_msm_state_type {
 #ifdef CONFIG_SUSPEND
 	boolean pm_suspended;
 #endif
-	int hpd_stable;
-	boolean hpd_prev_state;
-	boolean hpd_cable_chg_detected;
 	boolean full_auth_done;
 	boolean hpd_during_auth;
 	struct work_struct hpd_state_work, hpd_read_work;
-	struct timer_list hpd_state_timer;
 	struct completion ddc_sw_done;
 
+	bool hdcp_enable;
 	boolean hdcp_activating;
 	boolean reauth ;
 	struct work_struct hdcp_reauth_work, hdcp_work;
@@ -100,6 +97,9 @@ struct hdmi_msm_state_type {
 	void __iomem *hdmi_io;
 
 	struct external_common_state_type common;
+	boolean is_mhl_enabled;
+	struct completion hpd_event_processed;
+	boolean is_hpd_feature_off;
 };
 
 extern struct hdmi_msm_state_type *hdmi_msm_state;
@@ -113,7 +113,7 @@ void hdmi_phy_reset(void);
 void hdmi_msm_reset_core(void);
 void hdmi_msm_init_phy(int video_format);
 void hdmi_msm_powerdown_phy(void);
-void hdmi_frame_ctrl_cfg(const struct msm_hdmi_mode_timing_info *timing);
+void hdmi_frame_ctrl_cfg(const struct hdmi_disp_mode_timing_type *timing);
 void hdmi_msm_phy_status_poll(void);
 #endif
 
@@ -124,5 +124,5 @@ void hdmi_msm_cec_msg_recv(void);
 void hdmi_msm_cec_one_touch_play(void);
 void hdmi_msm_cec_msg_send(struct hdmi_msm_cec_msg *msg);
 #endif 
-
+void mhl_connect_api(boolean on);
 #endif 

@@ -70,7 +70,7 @@ static void diag_read_hsic_work_fn(struct work_struct *work)
 		if (buf_in_hsic) {
 			pr_debug("diag: read from HSIC\n");
 			num_reads_submitted++;
-			err = diag_bridge_read((char *)buf_in_hsic,
+			err = diag_bridge_read(0, (char *)buf_in_hsic,
 							READ_HSIC_BUF_SIZE);
 			if (err) {
 				num_reads_submitted--;
@@ -96,6 +96,10 @@ static void diag_read_hsic_work_fn(struct work_struct *work)
 static void diag_hsic_read_complete_callback(void *ctxt, char *buf,
 					int buf_size, int actual_size)
 {
+#if DIAG_XPST && defined(CONFIG_DIAGFWD_BRIDGE_CODE)
+	int type;
+	static int pkt_hdr = DIAG_BODY_OF_NEXT_PKT, first_pkt = 1;
+#endif
 	int err = -2;
 
 	if (!driver->hsic_ch) {
@@ -111,6 +115,28 @@ static void diag_hsic_read_complete_callback(void *ctxt, char *buf,
 			pr_err("diag: Out of diagmem for HSIC\n");
 		} else {
 			DIAGFWD_9K_RAWDATA(buf, "9K", DIAG_DBG_READ);
+#if DIAG_XPST && defined(CONFIG_DIAGFWD_BRIDGE_CODE)
+			if ((pkt_hdr == DIAG_HEAD_OF_NEXT_PKT ||
+				(first_pkt == 1)) && actual_size > 0) {
+				if (unlikely(first_pkt == 1)) first_pkt = 0;
+				type = checkcmd_modem_epst(buf);
+				if (type) {
+					modem_to_userspace(buf, actual_size, type, 1);
+					pkt_hdr = DIAG_HEAD_OF_NEXT_PKT;
+					
+					diagmem_free(driver,
+						(unsigned char *)buf, POOL_TYPE_HSIC);
+					return;
+				}
+				pkt_hdr = DIAG_BODY_OF_NEXT_PKT;
+			}
+
+			if ((actual_size == 1 && *buf == CONTROL_CHAR) ||
+					((actual_size >= 2) &&
+					(*(buf+actual_size-1) == CONTROL_CHAR &&
+					 *(buf+actual_size-2) != ESC_CHAR)))
+				pkt_hdr = DIAG_HEAD_OF_NEXT_PKT;
+#endif
 			/*
 			 * Send data in buf to be written on the
 			 * appropriate device, e.g. USB MDM channel
@@ -204,7 +230,7 @@ void diag_hsic_close(void)
 		driver->hsic_ch = 0;
 		if (driver->hsic_device_opened) {
 			driver->hsic_device_opened = 0;
-			diag_bridge_close();
+			diag_bridge_close(0);
 			pr_debug("diag: %s: closed successfully\n", __func__);
 		} else {
 			pr_debug("diag: %s: already closed\n", __func__);
@@ -223,8 +249,8 @@ int diagfwd_cancel_hsic(void)
 		if (driver->hsic_device_opened) {
 			driver->hsic_ch = 0;
 			driver->hsic_device_opened = 0;
-			diag_bridge_close();
-			err = diag_bridge_open(&hsic_diag_bridge_ops);
+			diag_bridge_close(0);
+			err = diag_bridge_open(0, &hsic_diag_bridge_ops);
 			if (err) {
 				pr_err("diag: HSIC channel open error: %d\n",
 					err);
@@ -330,9 +356,9 @@ static int diag_hsic_probe(struct platform_device *pdev)
 		if (driver->hsic_device_opened) {
 			
 			pr_warn("diag: HSIC channel already opened in probe\n");
-			diag_bridge_close();
+			diag_bridge_close(0);
 		}
-		err = diag_bridge_open(&hsic_diag_bridge_ops);
+		err = diag_bridge_open(0, &hsic_diag_bridge_ops);
 		if (err) {
 			pr_err("diag: could not open HSIC, err: %d\n", err);
 			driver->hsic_device_opened = 0;

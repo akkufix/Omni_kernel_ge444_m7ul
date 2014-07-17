@@ -148,6 +148,7 @@ struct vm_area_struct {
 		} vm_set;
 
 		struct raw_prio_tree_node prio_tree_node;
+		const char __user *anon_name;
 	} shared;
 
 	struct list_head anon_vma_chain; 
@@ -251,7 +252,12 @@ struct mm_struct {
 	
 	mm_context_t context;
 
-	unsigned long flags; /* Must use atomic bitops to access the bits */
+	
+	unsigned int faultstamp;
+	unsigned int token_priority;
+	unsigned int last_interval;
+
+	unsigned long flags; 
 
 	struct core_state *core_state; 
 #ifdef CONFIG_AIO
@@ -286,6 +292,15 @@ static inline void mm_init_cpumask(struct mm_struct *mm)
 static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
 {
 	return mm->cpu_vm_mask_var;
+}
+
+
+static inline const char __user *vma_get_anon_name(struct vm_area_struct *vma)
+{
+	if (vma->vm_file)
+		return NULL;
+
+	return vma->shared.anon_name;
 }
 
 #endif 
